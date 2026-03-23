@@ -1,4 +1,8 @@
 <p align="center">
+  <strong>WARNING: THIS IS A LOCAL COPY OF LibreChat. SEE BELOW FOR ORIGINAL SUPPORTED VERSION</strong>
+</p>
+
+<p align="center">
   <a href="https://librechat.ai">
     <img src="client/public/assets/logo.svg" height="256">
   </a>
