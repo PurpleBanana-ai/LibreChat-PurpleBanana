@@ -8,6 +8,7 @@ import {
   EToolResources,
   paramEndpoints,
   isAgentsEndpoint,
+  AgentCapabilities,
   replaceSpecialVars,
   providerEndpointMap,
 } from 'librechat-data-provider';
@@ -15,23 +16,23 @@ import type {
   AgentToolResources,
   AgentToolOptions,
   TEndpointOption,
+  ReasoningResponseKey,
   TFile,
   Agent,
   TUser,
 } from 'librechat-data-provider';
 import type { GenericTool, LCToolRegistry, ToolMap, LCTool } from '@librechat/agents';
+import type { IMongoFile, FileOwnerScope } from '@librechat/data-schemas';
 import type { Response as ServerResponse } from 'express';
-import type { IMongoFile } from '@librechat/data-schemas';
-import type { InitializeResultBase, ServerRequest, EndpointDbMethods } from '~/types';
-import {
-  optionalChainWithEmptyCheck,
-  extractLibreChatParams,
-  getModelMaxTokens,
-  getThreadData,
-} from '~/utils';
-import { filterFilesByEndpointConfig } from '~/files';
-import { generateArtifactsPrompt } from '~/prompts';
-import { getProviderConfig } from '~/endpoints';
+import type {
+  ServerRequest,
+  EndpointDbMethods,
+  EndpointTokenConfig,
+  InitializeResultBase,
+} from '~/types';
+import type { LCAvailableTools, RequestScopedMCPConnectionStore } from '../mcp/types';
+import type { ResolvedManualSkill, ResolvedAlwaysApplySkill } from './skills';
+import type { TFilterFilesByAgentAccess } from './resources';
 import {
   injectSkillCatalog,
   resolveManualSkills,
@@ -39,10 +40,30 @@ import {
   unionPrimeAllowedTools,
   MAX_PRIMED_SKILLS_PER_TURN,
 } from './skills';
-import { registerCodeExecutionTools } from './tools';
+import {
+  normalizeServerName,
+  requiresEphemeralUserConnection,
+  splitMCPToolKey,
+  normalizeAgentToolKeys,
+} from '~/mcp/utils';
+import {
+  optionalChainWithEmptyCheck,
+  extractLibreChatParams,
+  getModelMaxTokens,
+  getThreadData,
+} from '~/utils';
+import {
+  registerCodeExecutionTools,
+  registerFileAuthoringTools,
+  isFileAuthoringToolDefinition,
+} from './tools';
+import { registerMemoryTools, memoryToolUsageGuard } from './memory';
+import { applyIntentLabels, sanitizeIntentLabels } from './intent';
+import { applyBackgroundToolCalls } from './background';
+import { filterFilesByEndpointConfig } from '~/files';
+import { generateArtifactsPrompt } from '~/prompts';
+import { getProviderConfig } from '~/endpoints';
 import { primeResources } from './resources';
-import type { ResolvedManualSkill, ResolvedAlwaysApplySkill } from './skills';
-import type { TFilterFilesByAgentAccess } from './resources';
 
 /**
  * Fraction of context budget reserved as headroom when no explicit maxContextTokens is set.
@@ -51,6 +72,15 @@ import type { TFilterFilesByAgentAccess } from './resources';
  */
 const DEFAULT_RESERVE_RATIO = 0.05;
 const temporalSpecialVarRegex = /{{\s*(current_date|current_datetime|iso_datetime)\s*}}/i;
+const geminiModelVersionRegex = /^gemini-(\d+)(?:\.(\d+))?(?:-|$)/;
+const googleToolCombinationTextModels = [
+  'gemini-3-flash-preview',
+  'gemini-3-pro-preview',
+  'gemini-3.1-flash-lite',
+  'gemini-3.1-pro-preview',
+];
+const googleToolCombinationExcludedModalityRegex =
+  /(?:^|-)image(?:-|$)|(?:^|-)live(?:-|$)|(?:^|-)tts(?:-|$)/;
 
 function hasTemporalSpecialVars(text: string): boolean {
   return temporalSpecialVarRegex.test(text);
@@ -65,6 +95,13 @@ function appendAdditionalInstructions(agent: Agent, text?: string | null): void 
     .join('\n\n');
 }
 
+function getMaxCatalogSkills(req: ServerRequest): number | undefined {
+  const endpoints = req.config?.endpoints as
+    | Record<string, { skills?: { maxCatalogSkills?: number } } | undefined>
+    | undefined;
+  return endpoints?.[EModelEndpoint.agents]?.skills?.maxCatalogSkills;
+}
+
 function getToolName(tool: unknown): string | undefined {
   if (tool == null || typeof tool !== 'object') {
     return undefined;
@@ -77,7 +114,81 @@ function hasToolDefinition(toolDefinitions: LCTool[] | undefined, name: string):
   return toolDefinitions?.some((toolDefinition) => toolDefinition.name === name) === true;
 }
 
-function resolveAnthropicToolConflicts({
+function hasGoogleSearchTool(tool: unknown): boolean {
+  if (tool == null || typeof tool !== 'object') {
+    return false;
+  }
+  return 'googleSearch' in tool || 'googleSearchRetrieval' in tool;
+}
+
+function normalizeGoogleModelName(model: string): string {
+  const normalized = model.trim().toLowerCase();
+  return normalized.split('/').pop() ?? normalized;
+}
+
+function isKnownGoogleToolCombinationTextModel(model: string): boolean {
+  return googleToolCombinationTextModels.some(
+    (knownModel) => model === knownModel || model.startsWith(`${knownModel}-`),
+  );
+}
+
+function isGemini35OrLater(model: string): boolean {
+  const match = geminiModelVersionRegex.exec(model);
+  if (!match) {
+    return false;
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? '0');
+  return major > 3 || (major === 3 && minor >= 5);
+}
+
+function supportsGoogleToolCombination(model: unknown): boolean {
+  if (typeof model !== 'string') {
+    return false;
+  }
+  const normalized = normalizeGoogleModelName(model);
+  if (googleToolCombinationExcludedModalityRegex.test(normalized)) {
+    return false;
+  }
+  return isKnownGoogleToolCombinationTextModel(normalized) || isGemini35OrLater(normalized);
+}
+
+function isGoogleToolCombinationProvider(provider?: string): boolean {
+  return provider === Providers.GOOGLE || provider === Providers.VERTEXAI;
+}
+
+function shouldIncludeGoogleServerSideToolInvocations({
+  provider,
+  hasProviderTools,
+  hasAgentTools,
+}: {
+  provider?: string;
+  hasProviderTools: boolean;
+  hasAgentTools: boolean;
+}): boolean {
+  return isGoogleToolCombinationProvider(provider) && hasProviderTools && hasAgentTools;
+}
+
+function assertGoogleToolCombinationSupport(model: unknown): void {
+  if (!supportsGoogleToolCombination(model)) {
+    throw new Error(`{ "type": "${ErrorTypes.GOOGLE_TOOL_CONFLICT}"}`);
+  }
+}
+
+function enableGoogleServerSideToolInvocations({
+  agent,
+  llmConfig,
+}: {
+  agent: Agent;
+  llmConfig: Record<string, unknown>;
+}): void {
+  llmConfig.includeServerSideToolInvocations = true;
+  if (agent.model_parameters) {
+    (agent.model_parameters as Record<string, unknown>).includeServerSideToolInvocations = true;
+  }
+}
+
+function resolveProviderToolConflicts({
   provider,
   tools,
   toolDefinitions,
@@ -86,7 +197,7 @@ function resolveAnthropicToolConflicts({
   tools?: unknown[];
   toolDefinitions?: LCTool[];
 }): unknown[] | undefined {
-  if (provider !== Providers.ANTHROPIC || !tools?.length) {
+  if (!tools?.length) {
     return tools;
   }
 
@@ -94,9 +205,19 @@ function resolveAnthropicToolConflicts({
     return tools;
   }
 
+  const shouldRemoveTool = (tool: unknown): boolean => {
+    if (provider === Providers.ANTHROPIC) {
+      return getToolName(tool) === Tools.web_search;
+    }
+    if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI) {
+      return hasGoogleSearchTool(tool);
+    }
+    return false;
+  };
+
   let removed = 0;
   const resolvedTools = tools.filter((tool) => {
-    const shouldRemove = getToolName(tool) === Tools.web_search;
+    const shouldRemove = shouldRemoveTool(tool);
     if (shouldRemove) {
       removed += 1;
     }
@@ -105,7 +226,7 @@ function resolveAnthropicToolConflicts({
 
   if (removed > 0) {
     logger.debug(
-      `[initializeAgent] Removed ${removed} Anthropic native web_search tool(s); LibreChat web_search is enabled.`,
+      `[initializeAgent] Removed ${removed} ${provider} native web search tool(s); LibreChat web_search is enabled.`,
     );
   }
 
@@ -136,14 +257,52 @@ export type InitializedAgent = Agent & {
   toolMap?: ToolMap;
   /** Tool registry for PTC and tool search (only present when MCP tools with env classification exist) */
   toolRegistry?: LCToolRegistry;
+  /** Run-scoped MCP tool definitions for request-scoped servers. */
+  mcpAvailableTools?: Record<string, LCAvailableTools>;
+  /** Run-scoped MCP connections for request-scoped servers. */
+  requestScopedConnections?: RequestScopedMCPConnectionStore;
   /** Serializable tool definitions for event-driven execution */
   toolDefinitions?: LCTool[];
   /** Precomputed flag indicating if any tools have defer_loading enabled (for efficient runtime checks) */
   hasDeferredTools?: boolean;
+  /**
+   * Names of this agent's tools that were injected with the `run_in_background`
+   * param (capability enabled AND per-tool opt-in AND eligible). Threaded to the
+   * tool executor via `configurable` so it can enforce the per-tool background
+   * opt-in and gate the `check_background_task` poll tool at execution time.
+   */
+  backgroundToolNames?: string[];
+  /**
+   * Names of this agent's tools that received the host-injected `intent`
+   * param (capability enabled AND opted in AND eligible). Threaded to the
+   * tool executor via `configurable` so the arg is stripped before invoking
+   * tools that don't declare it, and stripped from schemas a self-spawn
+   * child or PTC sandbox inherits. SDK-native intent schemas are the tools'
+   * own and are never listed here.
+   */
+  intentToolNames?: string[];
+  /** Whether the inline memory tools (`set_memory`/`delete_memory`) were
+   *  registered for this agent. Authoritative LibreChat-only signal of the
+   *  inline memory opt-in for the execution path, since some contexts hold the
+   *  initialized config (the `memory` marker already expanded out of `tools`)
+   *  rather than the raw agent document. */
+  memoryToolsRegistered?: boolean;
   /** Whether the actions capability is enabled (resolved during tool loading) */
   actionsEnabled?: boolean;
+  /**
+   * The COMPLETE accessible-server audit this initialization resolved (via
+   * the agent-key or skill-prime heal). Retained so deferred/event-driven
+   * execution reuses the same snapshot instead of repeating the merged
+   * registry read — a transient failure there would fail-closed a tool the
+   * turn already advertised from the successful first audit.
+   */
+  accessibleMcpServerNames?: readonly string[];
   /** Maximum characters allowed in a single tool result before truncation. */
   maxToolResultChars?: number;
+  /** Response field to read model reasoning from for custom OpenAI-compatible endpoints. */
+  reasoningKey?: ReasoningResponseKey;
+  /** Whether to reconstruct `reasoning_content` from persisted history across turns (custom endpoint opt-in). */
+  includeReasoningHistory?: boolean;
   /**
    * Whether the code-execution environment is available *for this agent*.
    * Narrower than the incoming `params.codeEnvAvailable` admin flag — this
@@ -156,6 +315,18 @@ export type InitializedAgent = Agent & {
    * (`packages/api/src/agents/added.ts`), so the check is uniform.
    */
   codeEnvAvailable: boolean;
+  /**
+   * Whether stateful code sessions are active *for this agent*: the admin
+   * `stateful_code_sessions` capability AND the agent's builder opt-in
+   * (`agent.stateful_code_sessions`) AND `codeEnvAvailable`. Resolved once
+   * here; `createRun` walks this per-agent value to gate the run-level
+   * `toolExecution.sandbox` config.
+   */
+  statefulCodeSessions: boolean;
+  /** Whether host-side skill file authoring is available for this agent/run. */
+  skillAuthoringAvailable: boolean;
+  /** Host-side file authoring tool names registered for this run. */
+  fileAuthoringToolNames?: Set<string>;
   /** Accessible skill IDs for ACL checking at execute time */
   accessibleSkillIds?: import('mongoose').Types.ObjectId[];
   /**
@@ -195,6 +366,13 @@ export type InitializedAgent = Agent & {
    * call #1 the sandbox can't see the files at all.
    */
   primedCodeFiles?: import('@librechat/agents').CodeEnvFile[];
+  /**
+   * Resolved token/pricing config for this agent's endpoint (admin static
+   * `tokenConfig` and/or fetched custom-endpoint config). Surfaced from the
+   * provider `getOptions` result so the AgentClient bills, prices, and resolves
+   * context limits with the same numbers the UI shows — not default rates.
+   */
+  endpointTokenConfig?: EndpointTokenConfig;
 };
 
 export const DEFAULT_MAX_CONTEXT_TOKENS = 32000;
@@ -226,6 +404,10 @@ export interface InitializeAgentParams {
     model: string | null;
     tool_options: AgentToolOptions | undefined;
     tool_resources: AgentToolResources | undefined;
+    /** Full accessible MCP server names (operator + user DB) when the heal
+     *  already fetched them — lets execution-side collision guards see
+     *  cross-tier shadowing without another registry round-trip. */
+    accessibleMcpServerNames?: readonly string[];
   }) => Promise<{
     /** Full tool instances (only present when definitionsOnly=false) */
     tools?: GenericTool[];
@@ -233,6 +415,8 @@ export interface InitializeAgentParams {
     dynamicToolContextMap?: Record<string, unknown>;
     userMCPAuthMap?: Record<string, Record<string, string>>;
     toolRegistry?: LCToolRegistry;
+    mcpAvailableTools?: Record<string, LCAvailableTools>;
+    requestScopedConnections?: RequestScopedMCPConnectionStore;
     /** Serializable tool definitions for event-driven mode */
     toolDefinitions?: LCTool[];
     hasDeferredTools?: boolean;
@@ -254,8 +438,31 @@ export interface InitializeAgentParams {
   isInitialAgent?: boolean;
   /** Accessible skill IDs for this user (pre-computed by the caller via ACL query) */
   accessibleSkillIds?: import('mongoose').Types.ObjectId[];
+  /** Whether skill file authoring should be exposed even before a user has viewable skills. */
+  skillAuthoringAvailable?: boolean;
   /** Whether the code execution environment is available (execute_code capability enabled) */
   codeEnvAvailable?: boolean;
+  /**
+   * Whether the `run_in_background` capability is enabled for this run. When
+   * true, tools the agent opted in via `tool_options[name].run_in_background`
+   * (plus the background-native code pair, unless explicitly opted out) get a
+   * `run_in_background` schema param and the `check_background_task` poll
+   * tool is registered.
+   */
+  backgroundToolsAvailable?: boolean;
+  /**
+   * Whether the `tool_intents` capability is enabled for this run. When true,
+   * tools opted in via `tool_options[name].describe_intent` (native host
+   * tools default on) get an `intent` string injected as the FIRST schema
+   * property, rendered by the client as the call's live status label.
+   */
+  toolIntentsAvailable?: boolean;
+  /** Whether stateful code sessions are available (stateful_code_sessions capability enabled) */
+  statefulSessionsAvailable?: boolean;
+  /** Whether inline memory tools are available (memory capability enabled, memory
+   *  configured, and the user permitted). When true and the agent lists the `memory`
+   *  capability, `set_memory` + `delete_memory` are registered for the LLM. */
+  memoryAvailable?: boolean;
   /** Per-user skill active/inactive overrides for filtering the skill catalog. */
   skillStates?: Record<string, boolean>;
   /** Admin-configured default for shared skills (`true` = shared skills auto-activate). */
@@ -275,22 +482,43 @@ export interface InitializeAgentParams {
  * getConvoFiles not yet in data-schemas but included here for consistency
  */
 export interface InitializeAgentDbMethods extends EndpointDbMethods {
+  /**
+   * Names of every MCP server the user can reach (operator config + user DB).
+   * Consulted by the legacy-key heal ONLY when a configured name needs
+   * normalization: collision detection must see user-DB servers, or healing a
+   * raw key could produce a key that direct-first resolution routes to a
+   * different (DB) server. Optional — without it the heal falls back to the
+   * operator-config names.
+   */
+  getAccessibleMcpServerNames?: (userId?: string, role?: string) => Promise<string[]>;
   /** Update usage tracking for multiple files */
-  updateFilesUsage: (files: Array<{ file_id: string }>, fileIds?: string[]) => Promise<unknown[]>;
+  updateFilesUsage: (
+    files: Array<{ file_id: string }>,
+    fileIds?: string[],
+    options?: { user?: string; tenantId?: string | null },
+  ) => Promise<unknown[]>;
   /** Get files from database */
   getFiles: (filter: unknown, sort: unknown, select: unknown) => Promise<unknown[]>;
   /** Filter files by agent access permissions (ownership or agent attachment) */
   filterFilesByAgentAccess?: TFilterFilesByAgentAccess;
   /** Get tool files by IDs (user-uploaded files only, code files handled separately) */
-  getToolFilesByIds: (fileIds: string[], toolSet: Set<EToolResources>) => Promise<unknown[]>;
+  getToolFilesByIds: (
+    fileIds: string[],
+    toolSet: Set<EToolResources>,
+    ownerScope?: FileOwnerScope,
+  ) => Promise<unknown[]>;
   /** Get conversation file IDs */
   getConvoFiles: (conversationId: string) => Promise<string[] | null>;
   /** Get code-generated files by conversation ID and the file_ids
    *  referenced from messages in the current thread (collected via
    *  `messages.files[].file_id` during thread walk). */
-  getCodeGeneratedFiles?: (conversationId: string, threadFileIds?: string[]) => Promise<unknown[]>;
+  getCodeGeneratedFiles?: (
+    conversationId: string,
+    threadFileIds?: string[],
+    ownerScope?: FileOwnerScope,
+  ) => Promise<unknown[]>;
   /** Get user-uploaded execute_code files by file IDs (from message.files in thread) */
-  getUserCodeFiles?: (fileIds: string[]) => Promise<unknown[]>;
+  getUserCodeFiles?: (fileIds: string[], ownerScope: FileOwnerScope) => Promise<unknown[]>;
   /** Get messages for a conversation (supports select for field projection) */
   getMessages?: (
     filter: { conversationId: string },
@@ -322,6 +550,8 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
        * by the manual-invocation resolver. Defaults to `true`.
        */
       userInvocable?: boolean;
+      /** True for deployment-directory skills that are loaded in memory. */
+      deployment?: boolean;
     }>;
     has_more?: boolean;
     after?: string | null;
@@ -367,6 +597,8 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
      * caller can't bypass the popover-side filter.
      */
     userInvocable?: boolean;
+    /** True for deployment-directory skills that are loaded in memory. */
+    deployment?: boolean;
   } | null>;
   /**
    * Load accessible skills with `alwaysApply: true`, eagerly including
@@ -386,6 +618,8 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
       body: string;
       author: import('mongoose').Types.ObjectId;
       allowedTools?: string[];
+      /** True for deployment-directory skills that are loaded in memory. */
+      deployment?: boolean;
     }>;
     has_more?: boolean;
     after?: string | null;
@@ -420,9 +654,85 @@ export async function initializeAgent(
     allowedProviders,
     isInitialAgent = false,
   } = params;
+  const requestFileOwnerId = req.user?.id;
+  const requestFileOwnerScope: FileOwnerScope | undefined = requestFileOwnerId
+    ? { userId: requestFileOwnerId, tenantId: req.user?.tenantId }
+    : undefined;
 
   if (!db) {
     throw new Error('initializeAgent requires db methods to be passed');
+  }
+
+  /**
+   * Heal legacy MCP tool keys ONCE, before anything reads them: model-facing
+   * keys embed the normalized server name (cache keys, definition names,
+   * runtime instance names), so an agent document persisted with raw-named
+   * keys would neither load those tools nor have any of its per-tool
+   * `tool_options` honored. Every downstream consumer — the tool loader, the
+   * defer/programmatic classification, the background and intent passes —
+   * reads `agent.tools` / `agent.tool_options` after this point.
+   */
+  const configRawServerNames = Object.keys(req.config?.mcpConfig ?? {});
+  const configNeedsNormalization = configRawServerNames.some(
+    (name) => normalizeServerName(name) !== name,
+  );
+  /**
+   * Rewriting legacy keys requires a COMPLETE collision audit: the normalized
+   * form of an operator name may belong to a user-DB server, and healing into
+   * that key would route the tool to the wrong server. The audit therefore
+   * uses the full accessible set — fetched lazily, once, and ONLY when a
+   * configured name actually needs normalization AND the caller has
+   * delimiter-bearing keys to heal (a non-MCP agent never pays the lookup).
+   * When the audit cannot complete (no dep, or a transient failure), healing
+   * is SKIPPED entirely: un-healed raw keys still resolve through the
+   * direct-first candidates, so skipping is safe while rewriting is not.
+   */
+  let healNamesPromise: Promise<readonly string[] | null> | undefined;
+  const resolveHealNames = (): Promise<readonly string[] | null> => {
+    if (!configNeedsNormalization) {
+      return Promise.resolve(configRawServerNames);
+    }
+    if (db.getAccessibleMcpServerNames == null) {
+      return Promise.resolve(null);
+    }
+    healNamesPromise ??= db
+      .getAccessibleMcpServerNames(req.user?.id, req.user?.role)
+      /** The merged registry read tolerates config-server init failures and
+       *  can silently omit config-only servers; the snapshot-derived config
+       *  names restore them so the audit stays genuinely complete. */
+      .then((names): readonly string[] => [...new Set([...names, ...configRawServerNames])])
+      .catch((error): null => {
+        logger.warn(
+          '[initializeAgent] Failed to resolve accessible MCP server names; skipping legacy-key healing (collision audit unavailable):',
+          error,
+        );
+        return null;
+      });
+    return healNamesPromise;
+  };
+  const hasMCPKeyCandidates =
+    (agent.tools ?? []).some(
+      (tool) => typeof tool === 'string' && tool.includes(Constants.mcp_delimiter),
+    ) || Object.keys(agent.tool_options ?? {}).some((key) => key.includes(Constants.mcp_delimiter));
+  /**
+   * The COMPLETE audit set actually resolved this initialization — from the
+   * agent-key heal or the skill-prime heal — threaded to the tool loader so
+   * its collision guards neither repeat the lookup nor mistake the
+   * operator-only list for a complete audit.
+   */
+  let resolvedAuditNames: readonly string[] | undefined;
+  if (hasMCPKeyCandidates) {
+    const mcpHealNames = await resolveHealNames();
+    if (mcpHealNames != null) {
+      resolvedAuditNames = mcpHealNames;
+      const healedKeys = normalizeAgentToolKeys({
+        tools: agent.tools ?? undefined,
+        toolOptions: agent.tool_options,
+        rawServerNames: mcpHealNames,
+      });
+      agent.tools = healedKeys.tools;
+      agent.tool_options = healedKeys.toolOptions;
+    }
   }
 
   if (
@@ -467,7 +777,13 @@ export async function initializeAgent(
       }
     }
 
-    const toolFiles = (await db.getToolFilesByIds(fileIds, toolResourceSet)) as IMongoFile[];
+    const toolFiles = requestFileOwnerScope
+      ? ((await db.getToolFilesByIds(
+          fileIds,
+          toolResourceSet,
+          requestFileOwnerScope,
+        )) as IMongoFile[])
+      : [];
 
     /**
      * Retrieve execute_code files filtered to the current thread.
@@ -508,23 +824,57 @@ export async function initializeAgent(
        *  which sibling first generated them — see `getCodeGeneratedFiles`
        *  for the branched-conversation rationale. */
       if (db.getCodeGeneratedFiles) {
-        codeGeneratedFiles = (await db.getCodeGeneratedFiles(
-          conversationId,
-          threadFileIds,
-        )) as IMongoFile[];
+        codeGeneratedFiles = requestFileOwnerScope
+          ? ((await db.getCodeGeneratedFiles(
+              conversationId,
+              threadFileIds,
+              requestFileOwnerScope,
+            )) as IMongoFile[])
+          : [];
       }
 
-      if (db.getUserCodeFiles && threadFileIds && threadFileIds.length > 0) {
-        userCodeFiles = (await db.getUserCodeFiles(threadFileIds)) as IMongoFile[];
+      if (
+        db.getUserCodeFiles &&
+        requestFileOwnerScope &&
+        threadFileIds &&
+        threadFileIds.length > 0
+      ) {
+        userCodeFiles = (await db.getUserCodeFiles(
+          threadFileIds,
+          requestFileOwnerScope,
+        )) as IMongoFile[];
       }
     }
 
     const allToolFiles = toolFiles.concat(codeGeneratedFiles, userCodeFiles);
     if (requestFiles.length || allToolFiles.length) {
-      currentFiles = (await db.updateFilesUsage(requestFiles.concat(allToolFiles))) as IMongoFile[];
+      const requestUsageFiles =
+        requestFiles.length && requestFileOwnerId
+          ? ((await db.updateFilesUsage(requestFiles, undefined, {
+              user: requestFileOwnerId,
+              tenantId: req.user?.tenantId,
+            })) as IMongoFile[])
+          : [];
+      const requestUsageFileIds = new Set(requestUsageFiles.map((file) => file.file_id));
+      const trustedToolFiles = allToolFiles.filter(
+        (file) => !requestUsageFileIds.has(file.file_id),
+      );
+      let toolUsageFiles: IMongoFile[] = [];
+      if (trustedToolFiles.length > 0 && requestFileOwnerId) {
+        toolUsageFiles = (await db.updateFilesUsage(trustedToolFiles, undefined, {
+          user: requestFileOwnerId,
+          tenantId: req.user?.tenantId,
+        })) as IMongoFile[];
+      }
+      currentFiles = requestUsageFiles.concat(toolUsageFiles);
     }
   } else if (requestFiles.length) {
-    currentFiles = (await db.updateFilesUsage(requestFiles)) as IMongoFile[];
+    currentFiles = requestFileOwnerId
+      ? ((await db.updateFilesUsage(requestFiles, undefined, {
+          user: requestFileOwnerId,
+          tenantId: req.user?.tenantId,
+        })) as IMongoFile[])
+      : [];
   }
 
   if (currentFiles && currentFiles.length) {
@@ -579,7 +929,8 @@ export async function initializeAgent(
    * go first so their names win on dedup (primes earlier in the list
    * contribute before the same name gets deduped on a later prime).
    */
-  const hasSkillAccess = params.accessibleSkillIds && params.accessibleSkillIds.length > 0;
+  const hasSkillAccess = (params.accessibleSkillIds?.length ?? 0) > 0;
+  const skillAuthoringAvailable = params.skillAuthoringAvailable === true;
   let manualSkillPrimes: ResolvedManualSkill[] | undefined;
   let alwaysApplySkillPrimes: ResolvedAlwaysApplySkill[] | undefined;
   let extraAllowedToolNames: string[] = [];
@@ -657,7 +1008,34 @@ export async function initializeAgent(
       alwaysApplySkillPrimes = alwaysApplySkillPrimes.slice(0, budgetForAlwaysApply);
     }
 
-    const primesForUnion = [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])];
+    /** Skill `allowed-tools` are legacy-heal candidates too: a raw MCP key
+     *  declared before the normalized-key convention would neither dedupe
+     *  against the healed agent tools nor match the normalized-keyed tool
+     *  map, silently dropping the skill-contributed tool. Same lazy audit
+     *  and skip-on-unavailable semantics as the agent-key heal. */
+    const combinedPrimes = [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])];
+    const primesNeedHeal = combinedPrimes.some((prime) =>
+      prime.allowedTools?.some((name) => name.includes(Constants.mcp_delimiter)),
+    );
+    const primeHealNames = primesNeedHeal ? await resolveHealNames() : null;
+    if (primeHealNames != null) {
+      resolvedAuditNames = primeHealNames;
+    }
+    const primesForUnion =
+      primeHealNames != null
+        ? combinedPrimes.map((prime) =>
+            prime.allowedTools?.length
+              ? {
+                  ...prime,
+                  allowedTools: normalizeAgentToolKeys({
+                    tools: prime.allowedTools,
+                    toolOptions: undefined,
+                    rawServerNames: primeHealNames,
+                  }).tools,
+                }
+              : prime,
+          )
+        : combinedPrimes;
     if (primesForUnion.length > 0) {
       const union = unionPrimeAllowedTools({
         primes: primesForUnion,
@@ -699,6 +1077,7 @@ export async function initializeAgent(
       model: agent.model,
       tool_options: agent.tool_options,
       tool_resources,
+      accessibleMcpServerNames: resolvedAuditNames,
     });
 
   let loadToolsResult;
@@ -733,6 +1112,8 @@ export async function initializeAgent(
     dynamicToolContextMap,
     userMCPAuthMap,
     toolDefinitions: loadedToolDefinitions,
+    mcpAvailableTools,
+    requestScopedConnections,
     hasDeferredTools,
     actionsEnabled,
     tools: structuredTools,
@@ -743,6 +1124,8 @@ export async function initializeAgent(
     dynamicToolContextMap: {},
     userMCPAuthMap: undefined,
     toolRegistry: undefined,
+    mcpAvailableTools: undefined,
+    requestScopedConnections: undefined,
     toolDefinitions: [],
     hasDeferredTools: false,
     actionsEnabled: undefined,
@@ -847,9 +1230,9 @@ export async function initializeAgent(
    * never accidentally registers `bash_tool` or primes sandbox files
    * just because the admin globally enabled code execution.
    *
-   * Done BEFORE the `hasAgentTools` / GOOGLE_TOOL_CONFLICT gate so
-   * execute-code-only agents on Google/Vertex still trip the conflict
-   * guard when provider-specific tools are also configured. Also before
+   * Done before provider-tool merging so execute-code-only agents on
+   * Google/Vertex still surface as external function definitions when
+   * provider-specific tools are also configured. Also before
    * `injectSkillCatalog` so the skill path's own
    * `registerCodeExecutionTools` call upgrades `read_file` from the
    * code-only description to the skill-aware description without adding a
@@ -857,6 +1240,30 @@ export async function initializeAgent(
    */
   const agentRequestsCodeExec = (agent.tools ?? []).includes(Tools.execute_code);
   const effectiveCodeEnvAvailable = params.codeEnvAvailable === true && agentRequestsCodeExec;
+  /**
+   * Capability marker → definition names its registration produced this run,
+   * reported by the registrars themselves. `tool_options` entries keyed by a
+   * marker (`execute_code`, `memory`, `skills`) — from a model-spec selection
+   * or a hand-edited saved agent — resolve onto exactly these names in the
+   * background/intent passes, so the projection cannot drift from what
+   * actually got registered.
+   */
+  const capabilityToolNames = new Map<string, readonly string[]>();
+  const recordCapabilityToolNames = (capability: string, toolNames: readonly string[]): void => {
+    if (toolNames.length === 0) {
+      return;
+    }
+    const existing = capabilityToolNames.get(capability);
+    capabilityToolNames.set(capability, existing ? [...existing, ...toolNames] : toolNames);
+  };
+  /** Per-agent stateful-session truth: the admin capability AND the agent's
+   *  own builder opt-in AND a working code env. Resolved once here so the
+   *  registered bash description, the tool factories, and `createRun`'s
+   *  `toolExecution.sandbox` gate all agree for this agent. */
+  const effectiveStatefulSessions =
+    effectiveCodeEnvAvailable &&
+    params.statefulSessionsAvailable === true &&
+    agent.stateful_code_sessions === true;
   if (effectiveCodeEnvAvailable) {
     const codeExecResult = registerCodeExecutionTools({
       toolRegistry,
@@ -864,8 +1271,10 @@ export async function initializeAgent(
       includeBash: true,
       includeSkillFileInstructions: false,
       enableToolOutputReferences: effectiveCodeEnvAvailable,
+      statefulSessions: effectiveStatefulSessions,
     });
     toolDefinitions = codeExecResult.toolDefinitions;
+    recordCapabilityToolNames(AgentCapabilities.execute_code, codeExecResult.toolNames);
   } else if (agentRequestsCodeExec) {
     /**
      * Agent asked for `execute_code` but the admin-level gate is off —
@@ -880,9 +1289,107 @@ export async function initializeAgent(
     );
   }
 
+  /**
+   * Expand the `memory` capability marker into the inline `set_memory` +
+   * `delete_memory` tool pair, mirroring the `execute_code` expansion above.
+   * `params.memoryAvailable` is the full run-level gate (capability enabled,
+   * memory configured, user permitted); the marker on `agent.tools` is the
+   * per-agent opt-in. The runtime instances are created in the tool service.
+   */
+  const agentRequestsMemory = (agent.tools ?? []).includes(Tools.memory);
+  const inlineMemoryRegistered = params.memoryAvailable === true && agentRequestsMemory;
+  if (inlineMemoryRegistered) {
+    const memoryResult = registerMemoryTools({
+      toolRegistry,
+      toolDefinitions,
+      validKeys: req.config?.memory?.validKeys,
+    });
+    toolDefinitions = memoryResult.toolDefinitions;
+    recordCapabilityToolNames(AgentCapabilities.memory, memoryResult.toolNames);
+    appendAdditionalInstructions(agent, memoryToolUsageGuard);
+  } else if (agentRequestsMemory) {
+    logger.debug(
+      `[initializeAgent] Agent "${agent.id}" requests memory but memoryAvailable=${String(params.memoryAvailable)}; skipping set_memory + delete_memory registration.`,
+    );
+  }
+
+  if (skillAuthoringAvailable) {
+    const skillReadResult = registerCodeExecutionTools({
+      toolRegistry,
+      toolDefinitions,
+      includeBash: false,
+      includeSkillFileInstructions: true,
+      enableToolOutputReferences: effectiveCodeEnvAvailable,
+    });
+    toolDefinitions = skillReadResult.toolDefinitions;
+    recordCapabilityToolNames(AgentCapabilities.skills, skillReadResult.toolNames);
+  }
+
+  if (effectiveCodeEnvAvailable || skillAuthoringAvailable) {
+    const fileAuthoringResult = registerFileAuthoringTools({
+      toolRegistry,
+      toolDefinitions,
+      includeSkillFileInstructions: skillAuthoringAvailable,
+    });
+    toolDefinitions = fileAuthoringResult.toolDefinitions;
+    /** File authoring is owned by whichever capability switched it on —
+     *  both, when both are active, so either marker's selection governs. */
+    if (effectiveCodeEnvAvailable) {
+      recordCapabilityToolNames(AgentCapabilities.execute_code, fileAuthoringResult.toolNames);
+    }
+    if (skillAuthoringAvailable) {
+      recordCapabilityToolNames(AgentCapabilities.skills, fileAuthoringResult.toolNames);
+    }
+  }
+
+  let intentToolNames: string[] | undefined;
+
+  /**
+   * Inject the `run_in_background` param into eligible opted-in tools and
+   * register the `check_background_task` poll tool. Runs after all built-in
+   * tool registration so the full, final `toolDefinitions` set is considered.
+   * Opt-in is per-tool via `tool_options` for both saved and ephemeral agents;
+   * the code-execution pair is background-native and needs no opt-in.
+   */
+  let backgroundToolNames: string[] | undefined;
+  if (params.backgroundToolsAvailable === true) {
+    /** Tool names embed `normalizeServerName(server)` (see MCP.js tool keys)
+     *  while `mcpConfig` keys the original name, so index the ephemeral
+     *  servers by their normalized form. */
+    const ephemeralServerNames = new Set<string>();
+    for (const [serverName, serverConfig] of Object.entries(req.config?.mcpConfig ?? {})) {
+      if (serverConfig != null && requiresEphemeralUserConnection(serverConfig)) {
+        ephemeralServerNames.add(normalizeServerName(serverName));
+      }
+    }
+    /** Resolve the boundary against every configured server, not just the
+     *  ephemeral subset: a non-ephemeral name ending in an ephemeral one would
+     *  otherwise be misread as ephemeral. */
+    const allServerNames = Object.keys(req.config?.mcpConfig ?? {}).map(normalizeServerName);
+    const backgroundResult = applyBackgroundToolCalls({
+      toolDefinitions,
+      toolRegistry,
+      toolOptions: agent.tool_options,
+      capabilityToolNames,
+      /** Tools of ephemeral request-scoped MCP servers (runtime body
+       *  placeholders) never get the param: their connection dies at request
+       *  end, so the executor would only downgrade the call to foreground.
+       *  Unknown servers stay eligible — the executor's per-instance tag is
+       *  the fail-safe for those. */
+      excludeTool: (toolName) => {
+        const [, serverName] = splitMCPToolKey(toolName, allServerNames);
+        return serverName != null && ephemeralServerNames.has(serverName);
+      },
+    });
+    toolDefinitions = backgroundResult.toolDefinitions;
+    if (backgroundResult.backgroundToolNames.length > 0) {
+      backgroundToolNames = backgroundResult.backgroundToolNames;
+    }
+  }
+
   /** Check for tool presence from either full instances or definitions (event-driven mode) */
   const hasAgentTools = (structuredTools?.length ?? 0) > 0 || (toolDefinitions?.length ?? 0) > 0;
-  const providerTools = resolveAnthropicToolConflicts({
+  const providerTools = resolveProviderToolConflicts({
     provider: agent.provider,
     tools: options.tools,
     toolDefinitions,
@@ -893,12 +1400,20 @@ export async function initializeAgent(
     ? (providerTools as GenericTool[])
     : (structuredTools ?? []);
 
-  if (
-    (agent.provider === Providers.GOOGLE || agent.provider === Providers.VERTEXAI) &&
-    hasProviderTools &&
-    hasAgentTools
-  ) {
-    throw new Error(`{ "type": "${ErrorTypes.GOOGLE_TOOL_CONFLICT}"}`);
+  if (isGoogleToolCombinationProvider(agent.provider) && hasProviderTools && hasAgentTools) {
+    assertGoogleToolCombinationSupport(llmConfig.model);
+    if (
+      shouldIncludeGoogleServerSideToolInvocations({
+        provider: agent.provider,
+        hasProviderTools,
+        hasAgentTools,
+      })
+    ) {
+      enableGoogleServerSideToolInvocations({ agent, llmConfig });
+    }
+    if (structuredTools?.length) {
+      tools = structuredTools.concat(providerTools as GenericTool[]);
+    }
   } else if (
     (agent.provider === Providers.OPENAI ||
       agent.provider === Providers.AZURE ||
@@ -919,6 +1434,7 @@ export async function initializeAgent(
       text: agent.instructions,
       user: req.user ? (req.user as unknown as TUser) : null,
       now: req.conversationCreatedAt,
+      timezone: req.body?.timezone,
     });
     if (hasTemporalSpecialVars(agent.instructions)) {
       agent.instructions = undefined;
@@ -955,14 +1471,65 @@ export async function initializeAgent(
       contextWindowTokens: Number(agentMaxContextTokens) || 200_000,
       listSkillsByAccess: db?.listSkillsByAccess,
       codeEnvAvailable: effectiveCodeEnvAvailable,
+      statefulSessions: effectiveStatefulSessions,
       userId: req.user?.id,
       skillStates: params.skillStates,
       defaultActiveOnShare: params.defaultActiveOnShare,
+      maxCatalogSkills: getMaxCatalogSkills(req),
     });
     toolDefinitions = skillResult.toolDefinitions;
     skillCount = skillResult.skillCount;
     executableSkillIds = skillResult.activeSkillIds;
     activeSkillNames = skillResult.activeSkillNames;
+    recordCapabilityToolNames(AgentCapabilities.skills, skillResult.toolNames);
+  }
+
+  /**
+   * Intent labels run LAST, after every registration step — the skill
+   * catalog above both appends its own definition and REPLACES upgraded ones
+   * (e.g. the skill-aware `read_file`), so an earlier injection would be
+   * clobbered. Injection PREPENDS while background's param APPENDS, so
+   * `intent` is the first schema property regardless of this ordering.
+   * The sanitize pass then enforces the flip side: with the capability off
+   * it strips SDK-native intent labels (a real admin kill switch); with it
+   * on it enforces explicit per-tool opt-outs on late-registered
+   * definitions. Both are marker-guarded — a tool's own `intent` business
+   * parameter is never touched.
+   */
+  if (params.toolIntentsAvailable === true) {
+    const intentResult = applyIntentLabels({
+      toolDefinitions,
+      toolRegistry,
+      toolOptions: agent.tool_options,
+      capabilityToolNames,
+    });
+    toolDefinitions = intentResult.toolDefinitions;
+    if (intentResult.intentToolNames.length > 0) {
+      intentToolNames = intentResult.intentToolNames;
+    }
+  }
+  const intentSanitized = sanitizeIntentLabels({
+    toolDefinitions,
+    toolRegistry,
+    toolOptions: agent.tool_options,
+    capabilityEnabled: params.toolIntentsAvailable === true,
+    capabilityToolNames,
+  });
+  toolDefinitions = intentSanitized.toolDefinitions;
+
+  const hasFinalAgentTools =
+    (structuredTools?.length ?? 0) > 0 || (toolDefinitions?.length ?? 0) > 0;
+  if (isGoogleToolCombinationProvider(agent.provider) && hasProviderTools && hasFinalAgentTools) {
+    assertGoogleToolCombinationSupport(llmConfig.model);
+    if (
+      shouldIncludeGoogleServerSideToolInvocations({
+        provider: agent.provider,
+        hasProviderTools,
+        hasAgentTools: hasFinalAgentTools,
+      })
+    ) {
+      enableGoogleServerSideToolInvocations({ agent, llmConfig });
+    }
   }
 
   const agentMaxContextNum = Number(agentMaxContextTokens) || DEFAULT_MAX_CONTEXT_TOKENS;
@@ -993,18 +1560,34 @@ export async function initializeAgent(
       : undefined;
   const maxToolResultCharsResolved =
     providerMaxToolResultChars ?? endpointConfigs?.all?.maxToolResultChars;
+  const fileAuthoringToolNames = new Set(
+    (toolDefinitions ?? [])
+      .filter((toolDefinition) => isFileAuthoringToolDefinition(toolDefinition))
+      .map((toolDefinition) => toolDefinition.name),
+  );
 
   const initializedAgent: InitializedAgent = {
     ...agent,
     resendFiles,
     toolRegistry,
+    mcpAvailableTools,
+    requestScopedConnections,
     tool_resources,
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
+    backgroundToolNames,
+    intentToolNames,
     actionsEnabled,
+    accessibleMcpServerNames: resolvedAuditNames,
     baseContextTokens,
+    memoryToolsRegistered: inlineMemoryRegistered,
     codeEnvAvailable: effectiveCodeEnvAvailable,
+    statefulCodeSessions: effectiveStatefulSessions,
+    reasoningKey: customEndpointConfig?.customParams?.reasoningKey,
+    includeReasoningHistory: customEndpointConfig?.customParams?.includeReasoningHistory,
+    skillAuthoringAvailable,
+    fileAuthoringToolNames: fileAuthoringToolNames.size > 0 ? fileAuthoringToolNames : undefined,
     skillCount,
     accessibleSkillIds: executableSkillIds,
     activeSkillNames,
@@ -1023,6 +1606,7 @@ export async function initializeAgent(
         ? maxContextTokens
         : Math.max(1024, Math.round(baseContextTokens * (1 - DEFAULT_RESERVE_RATIO))),
     primedCodeFiles,
+    endpointTokenConfig: options.endpointTokenConfig,
   };
 
   return initializedAgent;

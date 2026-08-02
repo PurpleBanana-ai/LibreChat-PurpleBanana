@@ -10,6 +10,7 @@ const mockGetMCPServersRegistry = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn() },
+  getTenantId: jest.fn(),
   webSearchKeys: [],
 }));
 
@@ -22,7 +23,15 @@ jest.mock('librechat-data-provider', () => ({
 
 jest.mock('@librechat/api', () => ({
   MCPOAuthHandler: {
-    generateFlowId: jest.fn(() => 'user-1:test-server'),
+    generateFlowId: jest.fn((userId, serverName, tenantId) => {
+      const flowId = `${userId}:${serverName}`;
+      return tenantId ? `tenant:${encodeURIComponent(tenantId)}:${flowId}` : flowId;
+    }),
+    generateTokenFlowId: jest.fn((userId, serverName, tenantId) => {
+      const flowId = `${userId}:${serverName}`;
+      return tenantId ? `tenant:${encodeURIComponent(tenantId)}:${flowId}` : flowId;
+    }),
+    deleteFlowAndStateMapping: jest.fn().mockResolvedValue(undefined),
     revokeOAuthToken: jest.fn(),
   },
   MCPTokenStorage: {
@@ -32,6 +41,16 @@ jest.mock('@librechat/api', () => ({
   },
   normalizeHttpError: jest.fn((error) => error),
   extractWebSearchEnvVars: jest.fn((params) => params.keys),
+  getAppConfigOptionsFromUser: jest.fn((user) => {
+    const hasSourceIdentity =
+      user != null && Object.prototype.hasOwnProperty.call(user, 'idOnTheSource');
+    return {
+      role: user?.role,
+      userId: user?.id,
+      idOnTheSource: user?.id && hasSourceIdentity ? (user.idOnTheSource ?? null) : undefined,
+      tenantId: user?.tenantId,
+    };
+  }),
   needsRefresh: jest.fn(),
   getNewS3URL: jest.fn(),
 }));
@@ -78,7 +97,7 @@ jest.mock('~/cache', () => ({
   getLogStores: (...args) => mockGetLogStores(...args),
 }));
 
-const { logger } = require('@librechat/data-schemas');
+const { logger, getTenantId } = require('@librechat/data-schemas');
 const { MCPTokenStorage, MCPOAuthHandler } = require('@librechat/api');
 const { updateUserPluginsController } = require('~/server/controllers/UserController');
 
@@ -124,7 +143,10 @@ function setupMCPMocks() {
     getAllowedAddresses: jest.fn().mockReturnValue(null),
   };
 
-  mockGetAppConfig.mockResolvedValue({});
+  // Revocation reads the merged config's mcpSettings allowlists (not the registry getters).
+  mockGetAppConfig.mockResolvedValue({
+    mcpSettings: { allowedDomains: [], allowedAddresses: null },
+  });
   mockUpdateUserPlugins.mockResolvedValue();
   mockDeleteUserPluginAuth.mockResolvedValue();
   mockInvalidateCachedTools.mockResolvedValue();
@@ -138,6 +160,7 @@ function setupMCPMocks() {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  getTenantId.mockReturnValue(undefined);
 });
 
 describe('updateUserPluginsController MCP OAuth cleanup', () => {
@@ -160,7 +183,10 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
       deleteToken: expect.any(Function),
     });
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(MCPOAuthHandler.revokeOAuthToken).not.toHaveBeenCalled();
     expect(mcpManager.disconnectUserConnection).toHaveBeenCalledWith('user-1', 'test-server');
   });
@@ -176,7 +202,10 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
 
     expect(res.status).toHaveBeenCalledWith(200);
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(logger.warn).toHaveBeenCalledWith(
       '[clearStoredMCPOAuthState] Failed to delete MCP OAuth tokens for test-server:',
       cleanupError,
@@ -188,16 +217,18 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
     const getTokensFlowError = new Error('get tokens flow cache down');
     const oauthFlowError = new Error('oauth flow cache down');
     MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue(null);
-    flowManager.deleteFlow
-      .mockRejectedValueOnce(getTokensFlowError)
-      .mockRejectedValueOnce(oauthFlowError);
+    flowManager.deleteFlow.mockRejectedValueOnce(getTokensFlowError);
+    MCPOAuthHandler.deleteFlowAndStateMapping.mockRejectedValueOnce(oauthFlowError);
 
     const res = createResponse();
     await updateUserPluginsController(createRequest(), res);
 
     expect(res.status).toHaveBeenCalledWith(200);
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(logger.warn).toHaveBeenCalledWith(
       '[clearStoredMCPOAuthState] Failed to clear MCP OAuth flow state for test-server:',
       getTokensFlowError,
@@ -226,9 +257,36 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
       deleteToken: expect.any(Function),
     });
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(MCPTokenStorage.getTokens).not.toHaveBeenCalled();
     expect(MCPOAuthHandler.revokeOAuthToken).not.toHaveBeenCalled();
+  });
+
+  it('clears tenant-scoped and legacy OAuth flow state when tenant context exists', async () => {
+    const { flowManager } = setupMCPMocks();
+    getTenantId.mockReturnValue('tenant-a');
+    MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue(null);
+
+    const res = createResponse();
+    await updateUserPluginsController(createRequest(), res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(flowManager.deleteFlow).toHaveBeenCalledWith(
+      'tenant:tenant-a:user-1:test-server',
+      'mcp_get_tokens',
+    );
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'tenant:tenant-a:user-1:test-server',
+      flowManager,
+    );
+    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
   });
 
   it('clears stored OAuth token state when server config is missing', async () => {
@@ -245,7 +303,10 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
       deleteToken: expect.any(Function),
     });
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(MCPTokenStorage.getClientInfoAndMetadata).not.toHaveBeenCalled();
     expect(MCPOAuthHandler.revokeOAuthToken).not.toHaveBeenCalled();
   });
@@ -264,7 +325,10 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
       deleteToken: expect.any(Function),
     });
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(MCPTokenStorage.getClientInfoAndMetadata).not.toHaveBeenCalled();
     expect(MCPOAuthHandler.revokeOAuthToken).not.toHaveBeenCalled();
   });
@@ -296,7 +360,10 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
       deleteToken: expect.any(Function),
     });
     expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_get_tokens');
-    expect(flowManager.deleteFlow).toHaveBeenCalledWith('user-1:test-server', 'mcp_oauth');
+    expect(MCPOAuthHandler.deleteFlowAndStateMapping).toHaveBeenCalledWith(
+      'user-1:test-server',
+      flowManager,
+    );
     expect(MCPOAuthHandler.revokeOAuthToken).not.toHaveBeenCalled();
   });
 

@@ -1,4 +1,4 @@
-import { memo, useMemo, useCallback } from 'react';
+import { memo, useRef, useMemo, useCallback, Fragment } from 'react';
 import { ContentTypes } from 'librechat-data-provider';
 import type {
   TMessageContentParts,
@@ -6,11 +6,15 @@ import type {
   TAttachment,
   Agents,
 } from 'librechat-data-provider';
+import type { ReactNode, ReactElement } from 'react';
+import type { ToolCallGroupExpansionState } from './ToolCallGroup';
+import { mapAttachments, filterAttachmentsForPart, groupSequentialToolCalls } from '~/utils';
 import { ParallelContentRenderer, type PartWithIndex } from './ParallelContent';
-import { mapAttachments, groupSequentialToolCalls } from '~/utils';
+import { EditTextPart, EmptyText, AgentUpdate } from './Parts';
+import { lastVisibleContentIdx } from '~/utils/activityLabels';
 import { MessageContext, SearchContext } from '~/Providers';
-import { EditTextPart, EmptyText } from './Parts';
 import PendingSkillCall from './Parts/PendingSkillCall';
+import ApprovalProvider from './ApprovalContext';
 import MemoryArtifacts from './MemoryArtifacts';
 import ToolCallGroup from './ToolCallGroup';
 import Container from './Container';
@@ -18,6 +22,35 @@ import Part from './Part';
 
 const getToolCallId = (part: TMessageContentParts): string =>
   (part?.[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined)?.id ?? '';
+
+const getPartAgentId = (part: TMessageContentParts): string | undefined =>
+  (part as { agentId?: string })?.agentId ??
+  (part?.[ContentTypes.TOOL_CALL] as { agentId?: string } | undefined)?.agentId;
+
+const getToolGroupId = (parts: PartWithIndex[], fallbackScope: number): string => {
+  const firstPart = parts[0];
+  if (!firstPart) {
+    return 'empty';
+  }
+  /** Keyed on the first TOOL CALL, not the first part. An activity label
+   *  absorbs the block's leading THINK part when its text lands, so keying on
+   *  `parts[0]` would flip the key mid-run — remounting the group and losing
+   *  whatever the user had expanded. The tool calls themselves do not move. */
+  let firstToolIdx: number | undefined;
+  for (const { part, idx } of parts) {
+    const toolCallId = getToolCallId(part);
+    if (toolCallId) {
+      return `tool:${toolCallId}`;
+    }
+    if (firstToolIdx === undefined && part?.type === ContentTypes.TOOL_CALL) {
+      firstToolIdx = idx;
+    }
+  }
+  /** Same reasoning for id-less tool calls: anchor to the first TOOL entry's
+   *  index rather than the block's first part, which shifts when reasoning is
+   *  absorbed. Only a block with no tool call at all falls back to `parts[0]`. */
+  return `fallback:${fallbackScope}:${firstToolIdx ?? firstPart.idx}`;
+};
 
 type PartWithContextProps = {
   part: TMessageContentParts;
@@ -32,6 +65,7 @@ type PartWithContextProps = {
   isLast: boolean;
   partAttachments: TAttachment[] | undefined;
   hideAttachments?: boolean;
+  onToolExpand?: () => void;
 };
 
 const PartWithContext = memo(function PartWithContext({
@@ -47,6 +81,7 @@ const PartWithContext = memo(function PartWithContext({
   isLast,
   partAttachments,
   hideAttachments,
+  onToolExpand,
 }: PartWithContextProps) {
   const contextValue = useMemo(
     () => ({
@@ -72,6 +107,7 @@ const PartWithContext = memo(function PartWithContext({
         isLast={isLastPart}
         showCursor={isLastPart && isLast}
         hideAttachments={hideAttachments}
+        onToolExpand={onToolExpand}
       />
     </MessageContext.Provider>
   );
@@ -89,6 +125,14 @@ type ContentPartsProps = {
    * the full message object) so `React.memo` stays shallow-happy.
    */
   manualSkills?: string[];
+  /** ISO timestamp of the parent message, surfaced in parallel column headers. */
+  createdAt?: string | null;
+  /**
+   * Author icon + label node re-rendered before content that resumes after an
+   * inline STEER part — the steer renders as a full user turn inside the
+   * response, so what follows must be visibly re-attributed to the author.
+   */
+  authorHeader?: ReactNode;
   conversationId?: string | null;
   attachments?: TAttachment[];
   searchResults?: { [key: string]: SearchResultData };
@@ -123,12 +167,35 @@ const ContentParts = memo(function ContentParts({
   isSubmitting,
   setSiblingIdx,
   searchResults,
+  authorHeader,
   conversationId,
   isCreatedByUser,
   isLatestMessage,
+  createdAt,
 }: ContentPartsProps) {
   const attachmentMap = useMemo(() => mapAttachments(attachments ?? []), [attachments]);
   const effectiveIsSubmitting = isLatestMessage ? isSubmitting : false;
+  const toolGroupExpansionRef = useRef(new Map<string, ToolCallGroupExpansionState>());
+  const fallbackScopeRef = useRef({ messageId, scope: 0 });
+  if (fallbackScopeRef.current.messageId !== messageId) {
+    if (!effectiveIsSubmitting) {
+      fallbackScopeRef.current.scope += 1;
+      toolGroupExpansionRef.current.clear();
+    }
+    fallbackScopeRef.current.messageId = messageId;
+  }
+  const fallbackScope = fallbackScopeRef.current.scope;
+
+  const handleGroupExpansionChange = useCallback(
+    (groupId: string, state: ToolCallGroupExpansionState) => {
+      if (!state.userOverride) {
+        toolGroupExpansionRef.current.delete(groupId);
+        return;
+      }
+      toolGroupExpansionRef.current.set(groupId, state);
+    },
+    [],
+  );
 
   /**
    * Interim skill cards — rendered in a separate slot ABOVE the Parts
@@ -202,7 +269,10 @@ const ContentParts = memo(function ContentParts({
           isCreatedByUser={isCreatedByUser}
           nextType={content?.[idx + 1]?.type}
           isSubmitting={effectiveIsSubmitting}
-          partAttachments={attachmentMap[getToolCallId(part)]}
+          partAttachments={filterAttachmentsForPart(
+            attachmentMap[getToolCallId(part)],
+            getPartAgentId(part),
+          )}
         />
       );
     },
@@ -219,7 +289,7 @@ const ContentParts = memo(function ContentParts({
   );
 
   const renderGroupedPart = useCallback(
-    (part: TMessageContentParts, idx: number, isLastPart: boolean) => {
+    (part: TMessageContentParts, idx: number, isLastPart: boolean, onToolExpand?: () => void) => {
       return (
         <PartWithContext
           key={`provider-${messageId}-${idx}`}
@@ -233,8 +303,12 @@ const ContentParts = memo(function ContentParts({
           isCreatedByUser={isCreatedByUser}
           nextType={content?.[idx + 1]?.type}
           isSubmitting={effectiveIsSubmitting}
-          partAttachments={attachmentMap[getToolCallId(part)]}
+          partAttachments={filterAttachmentsForPart(
+            attachmentMap[getToolCallId(part)],
+            getPartAgentId(part),
+          )}
           hideAttachments
+          onToolExpand={onToolExpand}
         />
       );
     },
@@ -250,17 +324,35 @@ const ContentParts = memo(function ContentParts({
     ],
   );
 
-  const sequentialParts = useMemo<PartWithIndex[]>(() => {
+  /** `postSteerAuthors` marks each part that resumes the response after a
+   *  steer block — where attribution is re-rendered. The value is the ACTIVE
+   *  agent id when a preceding AGENT_UPDATE handed the run off (the resumed
+   *  content belongs to that agent, not the message-level author), undefined
+   *  for the top-level `authorHeader`. Read BEFORE applying the current
+   *  part's own handoff, so a resume point that IS an agent update keeps the
+   *  pre-handoff author and lets the real marker announce the transition. */
+  const { sequentialParts, postSteerAuthors } = useMemo(() => {
+    const parts: PartWithIndex[] = [];
+    const authors = new Map<number, string | undefined>();
     if (!content) {
-      return [];
+      return { sequentialParts: parts, postSteerAuthors: authors };
     }
-    const result: PartWithIndex[] = [];
+    let prevType: string | undefined;
+    let activeAgentId: string | undefined;
     content.forEach((part, idx) => {
-      if (part) {
-        result.push({ part, idx });
+      if (!part) {
+        return;
       }
+      if (prevType === ContentTypes.STEER && part.type !== ContentTypes.STEER) {
+        authors.set(idx, activeAgentId);
+      }
+      if (part.type === ContentTypes.AGENT_UPDATE) {
+        activeAgentId = part[ContentTypes.AGENT_UPDATE]?.agentId || undefined;
+      }
+      prevType = part.type;
+      parts.push({ part, idx });
     });
-    return result;
+    return { sequentialParts: parts, postSteerAuthors: authors };
   }, [content]);
 
   const groupedParts = useMemo(
@@ -269,12 +361,31 @@ const ContentParts = memo(function ContentParts({
         if (group.type === 'single') {
           return group;
         }
+        const groupId = getToolGroupId(group.parts, fallbackScope);
         const groupAttachments = group.parts.flatMap(
-          ({ part }) => attachmentMap[getToolCallId(part)] ?? [],
+          ({ part }) =>
+            filterAttachmentsForPart(attachmentMap[getToolCallId(part)], getPartAgentId(part)) ??
+            [],
         );
-        return { ...group, groupAttachments };
+        return { ...group, groupId, groupAttachments };
       }),
-    [sequentialParts, attachmentMap],
+    [sequentialParts, attachmentMap, fallbackScope],
+  );
+
+  /** The re-attribution node for a part resuming after a steer block, shared
+   *  by the sequential path and the parallel renderer's sequential stretches. */
+  const renderResumeAttribution = useCallback(
+    (idx: number): ReactElement | null => {
+      if (authorHeader == null || !postSteerAuthors.has(idx)) {
+        return null;
+      }
+      const activeAgentId = postSteerAuthors.get(idx);
+      if (activeAgentId != null) {
+        return <AgentUpdate key={`author-${messageId}-${idx}`} currentAgentId={activeAgentId} />;
+      }
+      return <Fragment key={`author-${messageId}-${idx}`}>{authorHeader}</Fragment>;
+    },
+    [authorHeader, postSteerAuthors, messageId],
   );
 
   // Early return: no content to render AND no pending skill cards
@@ -325,55 +436,81 @@ const ContentParts = memo(function ContentParts({
 
   const safeContent = content ?? [];
   const showEmptyCursor = safeContent.length === 0 && effectiveIsSubmitting;
-  const lastContentIdx = safeContent.length - 1;
+  /** Skips trailing BLANK label reservations — they render nothing, and
+   *  counting one as last would strip the streaming cursor from the last
+   *  VISIBLE part until the next delta. */
+  const lastContentIdx = lastVisibleContentIdx(safeContent);
 
   // Parallel content: use dedicated renderer with columns (TMessageContentParts includes ContentMetadata)
   const hasParallelContent = safeContent.some((part) => part?.groupId != null);
   if (hasParallelContent) {
     return (
-      <>
+      <ApprovalProvider>
         {renderPendingSkills()}
         <ParallelContentRenderer
           content={content}
           messageId={messageId}
+          createdAt={createdAt}
           conversationId={conversationId}
           attachments={attachments}
           searchResults={searchResults}
           isSubmitting={effectiveIsSubmitting}
           renderPart={renderPart}
+          renderResumeAttribution={renderResumeAttribution}
         />
-      </>
+      </ApprovalProvider>
     );
   }
 
   // Sequential content: render parts in order (90% of cases)
   return (
-    <SearchContext.Provider value={{ searchResults }}>
-      <MemoryArtifacts attachments={attachments} />
-      {renderPendingSkills()}
-      {showEmptyCursor && (
-        <Container>
-          <EmptyText />
-        </Container>
-      )}
-      {groupedParts.map((group) => {
-        if (group.type === 'single') {
-          const { part, idx } = group.part;
-          return renderPart(part, idx, idx === lastContentIdx);
-        }
-        return (
-          <ToolCallGroup
-            key={`tool-group-${group.parts[0].idx}`}
-            parts={group.parts}
-            isSubmitting={effectiveIsSubmitting}
-            isLast={group.parts.some((p) => p.idx === lastContentIdx)}
-            renderPart={renderGroupedPart}
-            lastContentIdx={lastContentIdx}
-            groupAttachments={group.groupAttachments}
-          />
-        );
-      })}
-    </SearchContext.Provider>
+    <ApprovalProvider>
+      <SearchContext.Provider value={{ searchResults }}>
+        <MemoryArtifacts attachments={attachments} />
+        {renderPendingSkills()}
+        {showEmptyCursor && (
+          <Container>
+            <EmptyText />
+          </Container>
+        )}
+        {groupedParts.flatMap((group) => {
+          const firstIdx = group.type === 'single' ? group.part.idx : (group.parts[0]?.idx ?? -1);
+          const nodes: ReactElement[] = [];
+          const attribution = renderResumeAttribution(firstIdx);
+          if (attribution != null) {
+            nodes.push(attribution);
+          }
+          if (group.type === 'single') {
+            const { part, idx } = group.part;
+            nodes.push(renderPart(part, idx, idx === lastContentIdx));
+            return nodes;
+          }
+          const { groupId } = group;
+          nodes.push(
+            <ToolCallGroup
+              key={`tool-group-${groupId}`}
+              parts={group.parts}
+              isSubmitting={effectiveIsSubmitting}
+              /** The label part is CONSUMED into the header, not listed in
+               *  `parts` — a filled label at the content tail must still
+               *  mark its group as last or nothing holds the streaming
+               *  cursor until the next delta. */
+              isLast={
+                group.parts.some((p) => p.idx === lastContentIdx) ||
+                group.labelPart?.idx === lastContentIdx
+              }
+              renderPart={renderGroupedPart}
+              lastContentIdx={lastContentIdx}
+              groupAttachments={group.groupAttachments}
+              initialExpansionState={toolGroupExpansionRef.current.get(groupId)}
+              onExpansionChange={(state) => handleGroupExpansionChange(groupId, state)}
+              labelPart={group.labelPart}
+            />,
+          );
+          return nodes;
+        })}
+      </SearchContext.Provider>
+    </ApprovalProvider>
   );
 });
 
