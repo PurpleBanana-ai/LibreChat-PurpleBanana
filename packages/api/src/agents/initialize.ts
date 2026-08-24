@@ -9,6 +9,9 @@ import {
   paramEndpoints,
   isAgentsEndpoint,
   AgentCapabilities,
+  resolveAllowedStatefulCodeEnvironments,
+  hasActivePiiFields,
+  hasActivePiiPatterns,
   replaceSpecialVars,
   providerEndpointMap,
 } from 'librechat-data-provider';
@@ -20,32 +23,56 @@ import type {
   TFile,
   Agent,
   TUser,
+  StatefulCodeEnvironment,
 } from 'librechat-data-provider';
 import type { GenericTool, LCToolRegistry, ToolMap, LCTool } from '@librechat/agents';
 import type { IMongoFile, FileOwnerScope } from '@librechat/data-schemas';
 import type { Response as ServerResponse } from 'express';
 import type {
+  ResolvedManualSkill,
+  ResolvedAlwaysApplySkill,
+  ResolvedSkillCatalog,
+  TListSkillsByAccess,
+  TGetSkillByName,
+} from './skills';
+import type {
   ServerRequest,
+  RequestBody,
   EndpointDbMethods,
   EndpointTokenConfig,
   InitializeResultBase,
 } from '~/types';
 import type { LCAvailableTools, RequestScopedMCPConnectionStore } from '../mcp/types';
-import type { ResolvedManualSkill, ResolvedAlwaysApplySkill } from './skills';
+import type { ContentTraversalLimitError } from '../protection/adapters/nested';
+import type { SkillContentInput } from '../protection/adapters/submissions';
+import type { TextContentFragment } from '../protection/types';
 import type { TFilterFilesByAgentAccess } from './resources';
+import type { MCPToolAlias } from '~/tools/classification';
 import {
   injectSkillCatalog,
+  resolveSkillCatalog,
   resolveManualSkills,
   resolveAlwaysApplySkills,
+  selectSkillPrimesForTurn,
   unionPrimeAllowedTools,
   MAX_PRIMED_SKILLS_PER_TURN,
 } from './skills';
+import {
+  getContentTraversalFragments,
+  isContentTraversalProtected,
+  isContentTraversalLimitError,
+} from '../protection/adapters/nested';
 import {
   normalizeServerName,
   requiresEphemeralUserConnection,
   splitMCPToolKey,
   normalizeAgentToolKeys,
 } from '~/mcp/utils';
+import {
+  normalizeStatefulCodeEnvironment,
+  resolveCodeExecutionContext,
+  type CodeExecutionContext,
+} from './execution';
 import {
   optionalChainWithEmptyCheck,
   extractLibreChatParams,
@@ -57,8 +84,17 @@ import {
   registerFileAuthoringTools,
   isFileAuthoringToolDefinition,
 } from './tools';
+import {
+  createStatefulCodeEnvironmentPolicyError,
+  isFatalAgentInitializationError,
+} from './errors';
+import { extractAgentContent, extractSkillContent } from '../protection/adapters/submissions';
+import { createConfiguredContentInspector, inspectContent } from '../protection/runtime';
+import { assertModelBoundContent } from '../middleware/modelBoundContent';
 import { registerMemoryTools, memoryToolUsageGuard } from './memory';
 import { applyIntentLabels, sanitizeIntentLabels } from './intent';
+import { ContentFilterError } from '../middleware/contentFilter';
+import { PARTIAL_RESOLVED_CONVERSATION } from './guard';
 import { applyBackgroundToolCalls } from './background';
 import { filterFilesByEndpointConfig } from '~/files';
 import { generateArtifactsPrompt } from '~/prompts';
@@ -82,6 +118,64 @@ const googleToolCombinationTextModels = [
 const googleToolCombinationExcludedModalityRegex =
   /(?:^|-)image(?:-|$)|(?:^|-)live(?:-|$)|(?:^|-)tts(?:-|$)/;
 
+function assertResolvedSkillContentAllowed(
+  skills: readonly SkillContentInput[],
+  filters: NonNullable<ServerRequest['config']>['filters'] | undefined,
+): void {
+  const pii = filters?.skills?.pii;
+  if (!hasActivePiiPatterns(pii) || skills.length === 0) {
+    return;
+  }
+
+  const inspectionSession = createConfiguredContentInspector({ filters })?.createSession();
+  if (inspectionSession == null) {
+    return;
+  }
+  const selectedFields = pii?.fields == null ? null : new Set<string>(pii.fields);
+  const selected = (field: string): boolean => selectedFields == null || selectedFields.has(field);
+  const traversalErrors: ContentTraversalLimitError[] = [];
+  for (const skill of skills) {
+    const projected: SkillContentInput = {
+      ...(selected('name') && { name: skill.name }),
+      ...(selected('display_title') && { displayTitle: skill.displayTitle }),
+      ...(selected('description') && { description: skill.description }),
+      ...(selected('category') && { category: skill.category }),
+      ...(selected('instructions') && {
+        body: skill.body,
+        instructions: skill.instructions,
+      }),
+      ...(selected('imported_text') && { importedText: skill.importedText }),
+      ...(selected('frontmatter') && { frontmatter: skill.frontmatter }),
+      ...((selected('file_name') || selected('file_text')) && {
+        files: skill.files?.map((file) => ({
+          ...(selected('file_name') && { name: file?.name, filename: file?.filename }),
+          ...(selected('file_text') && { text: file?.text, content: file?.content }),
+        })),
+      }),
+    };
+    let fragments: readonly TextContentFragment[];
+    try {
+      fragments = extractSkillContent(projected);
+    } catch (error) {
+      if (!isContentTraversalLimitError(error)) {
+        throw error;
+      }
+      fragments = getContentTraversalFragments(error);
+      traversalErrors.push(error);
+    }
+    const finding = inspectionSession.inspect(fragments);
+    if (finding != null) {
+      throw new ContentFilterError(finding);
+    }
+  }
+  const protectedTraversal = traversalErrors.find((error) =>
+    isContentTraversalProtected({ error, filters }),
+  );
+  if (protectedTraversal != null) {
+    throw protectedTraversal;
+  }
+}
+
 function hasTemporalSpecialVars(text: string): boolean {
   return temporalSpecialVarRegex.test(text);
 }
@@ -93,6 +187,32 @@ function appendAdditionalInstructions(agent: Agent, text?: string | null): void 
   agent.additional_instructions = [agent.additional_instructions ?? '', text]
     .filter(Boolean)
     .join('\n\n');
+}
+
+/**
+ * The request middleware already read this conversation once (`null` = looked up, absent).
+ * A stored document without `files` genuinely has none; only the branded lineage-only
+ * partial from a bound agent-event continuation cannot speak for the database.
+ */
+export function readResolvedConversationFiles(
+  req: Pick<ServerRequest, 'resolvedConversation'>,
+  conversationId: string,
+): string[] | undefined {
+  if (!Object.prototype.hasOwnProperty.call(req, 'resolvedConversation')) {
+    return undefined;
+  }
+  const resolved = req.resolvedConversation;
+  if (resolved === null) {
+    return [];
+  }
+  if (
+    resolved == null ||
+    resolved.conversationId !== conversationId ||
+    (resolved as Record<symbol, unknown>)[PARTIAL_RESOLVED_CONVERSATION] === true
+  ) {
+    return undefined;
+  }
+  return resolved.files ?? [];
 }
 
 function getMaxCatalogSkills(req: ServerRequest): number | undefined {
@@ -263,6 +383,8 @@ export type InitializedAgent = Agent & {
   requestScopedConnections?: RequestScopedMCPConnectionStore;
   /** Serializable tool definitions for event-driven execution */
   toolDefinitions?: LCTool[];
+  /** Both-direction identity aliases for MCP tools whose key spelling changed */
+  mcpToolAliases?: MCPToolAlias[];
   /** Precomputed flag indicating if any tools have defer_loading enabled (for efficient runtime checks) */
   hasDeferredTools?: boolean;
   /**
@@ -319,10 +441,16 @@ export type InitializedAgent = Agent & {
    * Whether stateful code sessions are active *for this agent*: the admin
    * `stateful_code_sessions` capability AND the agent's builder opt-in
    * (`agent.stateful_code_sessions`) AND `codeEnvAvailable`. Resolved once
-   * here; `createRun` walks this per-agent value to gate the run-level
-   * `toolExecution.sandbox` config.
+   * here and carried with the agent so execution routing never needs a
+   * graph-global stateful flag.
    */
   statefulCodeSessions: boolean;
+  /** Sharing scope for this agent's stateful code environment. */
+  statefulCodeEnvironment: Agent['stateful_code_environment'];
+  /** Trusted partition for transient code session ids and file references. */
+  codeSessionKey: string;
+  /** Trusted endpoint/profile context for artifact processing and runtime tools. */
+  codeExecutionContext: CodeExecutionContext;
   /** Whether host-side skill file authoring is available for this agent/run. */
   skillAuthoringAvailable: boolean;
   /** Host-side file authoring tool names registered for this run. */
@@ -392,6 +520,8 @@ export interface InitializeAgentParams {
   conversationId?: string | null;
   /** Parent message ID for determining the current thread (optional) */
   parentMessageId?: string | null;
+  /** Normalized body used by MCP runtime placeholders during tool discovery. */
+  requestBody?: RequestBody;
   /** Request files */
   requestFiles?: IMongoFile[];
   /** Function to load agent tools */
@@ -404,6 +534,9 @@ export interface InitializeAgentParams {
     model: string | null;
     tool_options: AgentToolOptions | undefined;
     tool_resources: AgentToolResources | undefined;
+    requestBody?: RequestBody;
+    /** Trusted endpoint/profile resolved for this agent before any code-file priming. */
+    codeExecutionContext: CodeExecutionContext;
     /** Full accessible MCP server names (operator + user DB) when the heal
      *  already fetched them — lets execution-side collision guards see
      *  cross-tier shadowing without another registry round-trip. */
@@ -420,6 +553,7 @@ export interface InitializeAgentParams {
     /** Serializable tool definitions for event-driven mode */
     toolDefinitions?: LCTool[];
     hasDeferredTools?: boolean;
+    mcpToolAliases?: MCPToolAlias[];
     actionsEnabled?: boolean;
     /**
      * Pre-uploaded code-env file refs for the agent's
@@ -459,6 +593,8 @@ export interface InitializeAgentParams {
   toolIntentsAvailable?: boolean;
   /** Whether stateful code sessions are available (stateful_code_sessions capability enabled) */
   statefulSessionsAvailable?: boolean;
+  /** Explicit deployment allowlist for request types that do not carry LibreChat config on req. */
+  allowedStatefulCodeEnvironments?: readonly StatefulCodeEnvironment[];
   /** Whether inline memory tools are available (memory capability enabled, memory
    *  configured, and the user permitted). When true and the agent lists the `memory`
    *  capability, `set_memory` + `delete_memory` are registered for the LLM. */
@@ -529,77 +665,9 @@ export interface InitializeAgentDbMethods extends EndpointDbMethods {
     files?: Array<{ file_id: string }>;
   }> | null>;
   /** List skill summaries for catalog injection (paginated, omits body/frontmatter) */
-  listSkillsByAccess?: (params: {
-    accessibleIds: import('mongoose').Types.ObjectId[];
-    limit: number;
-    cursor?: string | null;
-  }) => Promise<{
-    skills: Array<{
-      _id: import('mongoose').Types.ObjectId;
-      name: string;
-      description: string;
-      author: import('mongoose').Types.ObjectId;
-      /**
-       * When `true`, the skill is excluded from the catalog injected into
-       * the agent's additional_instructions and the model cannot invoke it
-       * via the `skill` tool. Manual `$` invocation is unaffected.
-       */
-      disableModelInvocation?: boolean;
-      /**
-       * When `false`, the skill is hidden from the `$` popover and rejected
-       * by the manual-invocation resolver. Defaults to `true`.
-       */
-      userInvocable?: boolean;
-      /** True for deployment-directory skills that are loaded in memory. */
-      deployment?: boolean;
-    }>;
-    has_more?: boolean;
-    after?: string | null;
-  }>;
-  /**
-   * Load a single skill by name, constrained to an ACL-accessible ID set.
-   * Returns the full document (including `body`) so manual invocation can
-   * prime SKILL.md without a second DB round-trip.
-   *
-   * `preferUserInvocable` (manual paths): on a same-name collision,
-   * prefer the newest doc with `userInvocable !== false`.
-   * `preferModelInvocable` (model paths — `skill` / `read_file`): on a
-   * same-name collision, prefer the newest doc with
-   * `disableModelInvocation !== true`. Both fall back to the newest match
-   * so the explicit-rejection error paths still fire when only the
-   * non-preferred variant exists.
-   */
-  getSkillByName?: (
-    name: string,
-    accessibleIds: import('mongoose').Types.ObjectId[],
-    options?: { preferUserInvocable?: boolean; preferModelInvocable?: boolean },
-  ) => Promise<{
-    _id: import('mongoose').Types.ObjectId;
-    name: string;
-    body: string;
-    author: import('mongoose').Types.ObjectId;
-    /**
-     * Skill-declared tool allowlist, forwarded verbatim from the skill doc.
-     * Surfaced so the resolver can carry it onto `ResolvedManualSkill` for
-     * future runtime enforcement without a second round-trip.
-     */
-    allowedTools?: string[];
-    /**
-     * Set when the skill was authored with `disable-model-invocation: true`.
-     * The skill tool handler short-circuits on this so a model that names
-     * such a skill (e.g. via hallucination or stale catalog) gets a clear
-     * rejection instead of silently executing.
-     */
-    disableModelInvocation?: boolean;
-    /**
-     * Set when the skill was authored with `user-invocable: false`. The
-     * manual-invocation resolver skips with a warn log so an API-direct
-     * caller can't bypass the popover-side filter.
-     */
-    userInvocable?: boolean;
-    /** True for deployment-directory skills that are loaded in memory. */
-    deployment?: boolean;
-  } | null>;
+  listSkillsByAccess?: TListSkillsByAccess;
+  /** Load a single skill by name, constrained to an ACL-accessible ID set. */
+  getSkillByName?: TGetSkillByName;
   /**
    * Load accessible skills with `alwaysApply: true`, eagerly including
    * `body` so the priming pipeline can splice at turn start without a
@@ -651,6 +719,7 @@ export async function initializeAgent(
     conversationId,
     endpointOption,
     parentMessageId,
+    requestBody,
     allowedProviders,
     isInitialAgent = false,
   } = params;
@@ -661,6 +730,41 @@ export async function initializeAgent(
 
   if (!db) {
     throw new Error('initializeAgent requires db methods to be passed');
+  }
+
+  /**
+   * Reject the stored agent definition before initialization performs usage
+   * accounting, resource priming, tool/MCP loading, or provider setup. Inspect
+   * definition fragments directly here: the raw agent may still contain
+   * canonical file IDs that can only be validated after resource hydration.
+   */
+  let agentFragments: readonly TextContentFragment[] = [];
+  let agentTraversalError: ContentTraversalLimitError | null = null;
+  try {
+    agentFragments = extractAgentContent(
+      agent as unknown as Parameters<typeof extractAgentContent>[0],
+    );
+  } catch (error) {
+    if (!isContentTraversalLimitError(error)) {
+      throw error;
+    }
+    agentFragments = getContentTraversalFragments(error);
+    agentTraversalError = error;
+  }
+  const agentDefinitionFinding = inspectContent(agentFragments, {
+    filters: req.config?.filters,
+  });
+  if (agentDefinitionFinding != null) {
+    throw new ContentFilterError(agentDefinitionFinding);
+  }
+  if (
+    agentTraversalError != null &&
+    isContentTraversalProtected({
+      error: agentTraversalError,
+      filters: req.config?.filters,
+    })
+  ) {
+    throw agentTraversalError;
   }
 
   /**
@@ -745,6 +849,85 @@ export async function initializeAgent(
     );
   }
 
+  /**
+   * Manual and always-apply skill resolution is read-only. Resolve and inspect
+   * those exact model-bound skill bodies before file usage/resource priming or
+   * tool loading, then reuse the results below when expanding allowed tools.
+   */
+  const hasSkillAccess = (params.accessibleSkillIds?.length ?? 0) > 0;
+  const skillAuthoringAvailable = params.skillAuthoringAvailable === true;
+  let manualSkillPrimes: ResolvedManualSkill[] | undefined;
+  let alwaysApplySkillPrimes: ResolvedAlwaysApplySkill[] | undefined;
+  let extraAllowedToolNames: string[] = [];
+  let perSkillExtras: Map<string, string[]> = new Map();
+  let resolvedSkillCatalog: ResolvedSkillCatalog | undefined;
+  if (hasSkillAccess) {
+    const [manualPrimesResult, alwaysApplyPrimesResult, catalogResult] = await Promise.all([
+      params.manualSkills?.length && db.getSkillByName
+        ? resolveManualSkills({
+            names: params.manualSkills,
+            getSkillByName: db.getSkillByName,
+            accessibleSkillIds: params.accessibleSkillIds!,
+            userId: req.user?.id,
+            skillStates: params.skillStates,
+            defaultActiveOnShare: params.defaultActiveOnShare,
+          })
+        : Promise.resolve<ResolvedManualSkill[] | undefined>(undefined),
+      db.listAlwaysApplySkills
+        ? resolveAlwaysApplySkills({
+            listAlwaysApplySkills: db.listAlwaysApplySkills,
+            accessibleSkillIds: params.accessibleSkillIds!,
+            userId: req.user?.id,
+            skillStates: params.skillStates,
+            defaultActiveOnShare: params.defaultActiveOnShare,
+          })
+        : Promise.resolve<ResolvedAlwaysApplySkill[] | undefined>(undefined),
+      hasActivePiiFields(req.config?.filters?.skills?.pii, ['name', 'description'])
+        ? resolveSkillCatalog({
+            accessibleSkillIds: params.accessibleSkillIds!,
+            listSkillsByAccess: db.listSkillsByAccess,
+            userId: req.user?.id,
+            skillStates: params.skillStates,
+            defaultActiveOnShare: params.defaultActiveOnShare,
+            maxCatalogSkills: getMaxCatalogSkills(req),
+          })
+        : Promise.resolve<ResolvedSkillCatalog | undefined>(undefined),
+    ]);
+
+    manualSkillPrimes = manualPrimesResult;
+    alwaysApplySkillPrimes = alwaysApplyPrimesResult;
+    resolvedSkillCatalog = catalogResult;
+
+    const selectedPrimes = selectSkillPrimesForTurn({
+      manualSkillPrimes: manualSkillPrimes ?? [],
+      alwaysApplySkillPrimes: alwaysApplySkillPrimes ?? [],
+    });
+    if (selectedPrimes.alwaysApplyDedupedFromManual > 0) {
+      logger.info(
+        `[initializeAgent] Dropped ${selectedPrimes.alwaysApplyDedupedFromManual} always-apply prime(s) already present in the manual list; same-named skills prime only once per turn.`,
+      );
+    }
+    if (selectedPrimes.alwaysApplyDropped > 0) {
+      logger.warn(
+        `[initializeAgent] Combined primes exceeds MAX_PRIMED_SKILLS_PER_TURN (${MAX_PRIMED_SKILLS_PER_TURN}); truncating ${selectedPrimes.alwaysApplyDropped} always-apply prime(s) so every initializer consumer sees the model-bound set.`,
+      );
+    }
+    manualSkillPrimes = manualSkillPrimes == null ? undefined : selectedPrimes.manualSkillPrimes;
+    alwaysApplySkillPrimes =
+      alwaysApplySkillPrimes == null ? undefined : selectedPrimes.alwaysApplySkillPrimes;
+
+    assertResolvedSkillContentAllowed(
+      [
+        ...(manualSkillPrimes ?? []),
+        ...(alwaysApplySkillPrimes ?? []),
+        ...(resolvedSkillCatalog?.activeSkills.filter(
+          (skill) => skill.disableModelInvocation !== true,
+        ) ?? []),
+      ],
+      req.config?.filters,
+    );
+  }
+
   let currentFiles: IMongoFile[] | undefined;
 
   const _modelOptions = structuredClone(
@@ -762,6 +945,41 @@ export async function initializeAgent(
   const provider = agent.provider;
   agent.endpoint = provider;
 
+  /** Resolve the per-agent Code API route before resource/tool priming. A
+   * stateful agent must perform freshness checks and recovery uploads against
+   * the same isolated deployment its eventual `/exec` request will use. */
+  const agentRequestsCodeExec = (agent.tools ?? []).includes(Tools.execute_code);
+  const effectiveCodeEnvAvailable = params.codeEnvAvailable === true && agentRequestsCodeExec;
+  const effectiveStatefulSessions =
+    effectiveCodeEnvAvailable &&
+    params.statefulSessionsAvailable === true &&
+    agent.stateful_code_sessions === true;
+  const statefulCodeEnvironment = normalizeStatefulCodeEnvironment(agent.stateful_code_environment);
+  if (effectiveStatefulSessions) {
+    const allowedStatefulCodeEnvironments = resolveAllowedStatefulCodeEnvironments(
+      params.allowedStatefulCodeEnvironments ??
+        req.config?.endpoints?.[EModelEndpoint.agents]?.statefulCodeSessions?.allowedEnvironments,
+    );
+    if (!allowedStatefulCodeEnvironments.includes(statefulCodeEnvironment)) {
+      throw createStatefulCodeEnvironmentPolicyError(statefulCodeEnvironment);
+    }
+  }
+  const codeExecutionContext = resolveCodeExecutionContext({
+    statefulSessions: effectiveStatefulSessions,
+    environment: statefulCodeEnvironment,
+    userId: requestFileOwnerId,
+    agentId: agent.id,
+    conversationId,
+  });
+  const requestFileIds = [
+    ...new Set(
+      requestFiles
+        .map((file) => file.file_id)
+        .filter((fileId): fileId is string => typeof fileId === 'string' && fileId.length > 0),
+    ),
+  ];
+  const toolFileIds: string[] = [];
+
   /**
    * Load conversation files for ALL agents, not just the initial agent.
    * This enables handoff agents to access files that were uploaded earlier
@@ -769,7 +987,6 @@ export async function initializeAgent(
    * on handoff agents would fail to find previously attached files.
    */
   if (conversationId != null && resendFiles) {
-    const fileIds = (await db.getConvoFiles(conversationId)) ?? [];
     const toolResourceSet = new Set<EToolResources>();
     for (const tool of agent.tools ?? []) {
       if (EToolResources[tool as keyof typeof EToolResources]) {
@@ -777,104 +994,126 @@ export async function initializeAgent(
       }
     }
 
-    const toolFiles = requestFileOwnerScope
-      ? ((await db.getToolFilesByIds(
-          fileIds,
-          toolResourceSet,
-          requestFileOwnerScope,
-        )) as IMongoFile[])
-      : [];
+    const getThreadMessages = db.getMessages;
+    /** Falsy anchors cannot match a parent chain, so they get no walk. */
+    const threadAnchor =
+      parentMessageId && parentMessageId !== Constants.NO_PARENT ? parentMessageId : null;
+    const needsThreadWalk =
+      toolResourceSet.has(EToolResources.execute_code) &&
+      threadAnchor != null &&
+      getThreadMessages != null;
+
+    /**
+     * The conversation's file refs and the thread walk share no inputs, so they resolve
+     * together. Both gate the model call, and this runs on every turn — each serialized
+     * round trip here is time-to-first-token the user waits through.
+     *
+     * Thread walk selects only the fields traversal needs. Both `files` (user uploads)
+     * and `attachments` (code-execution outputs from `processCodeOutput`) carry the
+     * `file_id` refs the next turn must prime — selecting only `files` silently drops
+     * every code-output ref.
+     */
+    const [convoFileIds, threadMessages] = await Promise.all([
+      readResolvedConversationFiles(req, conversationId) ?? db.getConvoFiles(conversationId),
+      needsThreadWalk && getThreadMessages
+        ? getThreadMessages({ conversationId }, 'messageId parentMessageId files attachments')
+        : null,
+    ]);
+    const fileIds = convoFileIds ?? [];
+
+    /** Walk the parent chain and collect file_ids referenced by
+     *  any message in the thread (`messages.files[].file_id` +
+     *  `messages.attachments[].file_id`). Used as the primary
+     *  anchor for both `getCodeGeneratedFiles` and
+     *  `getUserCodeFiles` — message ids no longer needed at
+     *  this layer. */
+    const threadFileIds =
+      threadMessages && threadMessages.length > 0
+        ? getThreadData(threadMessages, threadAnchor).fileIds
+        : undefined;
 
     /**
      * Retrieve execute_code files filtered to the current thread.
      * This includes both code-generated files and user-uploaded execute_code files.
+     *
+     * Code-generated and user-uploaded execute_code files share the same primary anchor:
+     * file_ids referenced by messages in the current thread. The two queries differ only
+     * by `context` (`execute_code` for generated outputs, others for uploads). Anchoring
+     * both on `threadFileIds` reaches files regardless of which sibling first generated
+     * them — see `getCodeGeneratedFiles` for the branched-conversation rationale.
      */
-    let codeGeneratedFiles: IMongoFile[] = [];
-    let userCodeFiles: IMongoFile[] = [];
-
-    if (toolResourceSet.has(EToolResources.execute_code)) {
-      let threadFileIds: string[] | undefined;
-
-      if (parentMessageId && parentMessageId !== Constants.NO_PARENT && db.getMessages) {
-        /** Only select fields needed for thread traversal. Both
-         *  `files` (user uploads) and `attachments` (code-execution
-         *  outputs from `processCodeOutput`) carry the `file_id`
-         *  refs the next turn must prime — selecting only `files`
-         *  silently drops every code-output ref. */
-        const messages = await db.getMessages(
-          { conversationId },
-          'messageId parentMessageId files attachments',
-        );
-        if (messages && messages.length > 0) {
-          /** Walk the parent chain and collect file_ids referenced by
-           *  any message in the thread (`messages.files[].file_id` +
-           *  `messages.attachments[].file_id`). Used as the primary
-           *  anchor for both `getCodeGeneratedFiles` and
-           *  `getUserCodeFiles` — message ids no longer needed at
-           *  this layer. */
-          threadFileIds = getThreadData(messages, parentMessageId).fileIds;
-        }
-      }
-
-      /** Code-generated and user-uploaded execute_code files share the
-       *  same primary anchor: file_ids referenced by messages in the
-       *  current thread. The two queries differ only by `context`
-       *  (`execute_code` for generated outputs, others for uploads).
-       *  Anchoring both on `threadFileIds` reaches files regardless of
-       *  which sibling first generated them — see `getCodeGeneratedFiles`
-       *  for the branched-conversation rationale. */
-      if (db.getCodeGeneratedFiles) {
-        codeGeneratedFiles = requestFileOwnerScope
-          ? ((await db.getCodeGeneratedFiles(
-              conversationId,
-              threadFileIds,
-              requestFileOwnerScope,
-            )) as IMongoFile[])
-          : [];
-      }
-
-      if (
-        db.getUserCodeFiles &&
-        requestFileOwnerScope &&
-        threadFileIds &&
-        threadFileIds.length > 0
-      ) {
-        userCodeFiles = (await db.getUserCodeFiles(
-          threadFileIds,
-          requestFileOwnerScope,
-        )) as IMongoFile[];
-      }
-    }
+    const wantsCodeFiles = toolResourceSet.has(EToolResources.execute_code);
+    const [toolFiles, codeGeneratedFiles, userCodeFiles] = await Promise.all([
+      requestFileOwnerScope
+        ? (db.getToolFilesByIds(fileIds, toolResourceSet, requestFileOwnerScope) as Promise<
+            IMongoFile[]
+          >)
+        : ([] as IMongoFile[]),
+      wantsCodeFiles && db.getCodeGeneratedFiles && requestFileOwnerScope
+        ? (db.getCodeGeneratedFiles(
+            conversationId,
+            threadFileIds,
+            requestFileOwnerScope,
+          ) as Promise<IMongoFile[]>)
+        : ([] as IMongoFile[]),
+      wantsCodeFiles &&
+      db.getUserCodeFiles &&
+      requestFileOwnerScope &&
+      threadFileIds &&
+      threadFileIds.length > 0
+        ? (db.getUserCodeFiles(threadFileIds, requestFileOwnerScope) as Promise<IMongoFile[]>)
+        : ([] as IMongoFile[]),
+    ]);
 
     const allToolFiles = toolFiles.concat(codeGeneratedFiles, userCodeFiles);
-    if (requestFiles.length || allToolFiles.length) {
-      const requestUsageFiles =
-        requestFiles.length && requestFileOwnerId
-          ? ((await db.updateFilesUsage(requestFiles, undefined, {
-              user: requestFileOwnerId,
-              tenantId: req.user?.tenantId,
-            })) as IMongoFile[])
-          : [];
-      const requestUsageFileIds = new Set(requestUsageFiles.map((file) => file.file_id));
-      const trustedToolFiles = allToolFiles.filter(
-        (file) => !requestUsageFileIds.has(file.file_id),
-      );
-      let toolUsageFiles: IMongoFile[] = [];
-      if (trustedToolFiles.length > 0 && requestFileOwnerId) {
-        toolUsageFiles = (await db.updateFilesUsage(trustedToolFiles, undefined, {
-          user: requestFileOwnerId,
-          tenantId: req.user?.tenantId,
-        })) as IMongoFile[];
+    const snapshotFileIds = new Set(requestFileIds);
+    for (const file of allToolFiles) {
+      if (typeof file.file_id !== 'string' || snapshotFileIds.has(file.file_id)) {
+        continue;
       }
-      currentFiles = requestUsageFiles.concat(toolUsageFiles);
+      snapshotFileIds.add(file.file_id);
+      toolFileIds.push(file.file_id);
     }
-  } else if (requestFiles.length) {
-    currentFiles = requestFileOwnerId
-      ? ((await db.updateFilesUsage(requestFiles, undefined, {
-          user: requestFileOwnerId,
-          tenantId: req.user?.tenantId,
-        })) as IMongoFile[])
-      : [];
+  }
+
+  /**
+   * Hydrate the complete candidate set through one owner-scoped, read-only
+   * query. Some discovery queries intentionally omit file text; this snapshot
+   * includes the content fields needed by policy checks. `updateFilesUsage`
+   * both mutates usage and returns hydrated rows, so it cannot be the hydrator:
+   * keep this exact snapshot authoritative for inspection, priming, and the
+   * later usage update to avoid a post-inspection re-read.
+   */
+  const snapshotFileIds = [...requestFileIds, ...toolFileIds];
+  let requestUsageFiles: IMongoFile[] = [];
+  let toolUsageFiles: IMongoFile[] = [];
+  if (requestFileOwnerScope && snapshotFileIds.length > 0) {
+    const hydratedFiles =
+      ((await db.getFiles(
+        {
+          file_id: { $in: snapshotFileIds },
+          user: requestFileOwnerScope.userId,
+          ...(requestFileOwnerScope.tenantId != null && {
+            tenantId: requestFileOwnerScope.tenantId,
+          }),
+        },
+        {},
+        {},
+      )) as IMongoFile[] | null) ?? [];
+    const hydratedFilesById = new Map(
+      hydratedFiles
+        .filter((file) => snapshotFileIds.includes(file.file_id))
+        .map((file) => [file.file_id, file]),
+    );
+    requestUsageFiles = requestFileIds
+      .map((fileId) => hydratedFilesById.get(fileId))
+      .filter((file): file is IMongoFile => file != null);
+    toolUsageFiles = toolFileIds
+      .map((fileId) => hydratedFilesById.get(fileId))
+      .filter((file): file is IMongoFile => file != null);
+  }
+  if (requestFiles.length > 0 || toolFileIds.length > 0) {
+    currentFiles = requestUsageFiles.concat(toolUsageFiles);
   }
 
   if (currentFiles && currentFiles.length) {
@@ -887,6 +1126,30 @@ export async function initializeAgent(
       files: currentFiles,
       endpoint: agent.endpoint ?? '',
       endpointType,
+    });
+  }
+
+  assertModelBoundContent({
+    filters: req.config?.filters,
+    files: currentFiles,
+  });
+
+  /**
+   * Usage accounting is the first file mutation. It runs only after every
+   * hydrated file in the exact snapshot above has passed endpoint filtering
+   * and current content policy checks. Ignore returned rows so priming cannot
+   * observe a different post-inspection snapshot.
+   */
+  if (requestFileOwnerId && requestUsageFiles.length > 0) {
+    await db.updateFilesUsage(requestUsageFiles, undefined, {
+      user: requestFileOwnerId,
+      tenantId: req.user?.tenantId,
+    });
+  }
+  if (requestFileOwnerId && toolUsageFiles.length > 0) {
+    await db.updateFilesUsage(toolUsageFiles, undefined, {
+      user: requestFileOwnerId,
+      tenantId: req.user?.tenantId,
     });
   }
 
@@ -929,85 +1192,7 @@ export async function initializeAgent(
    * go first so their names win on dedup (primes earlier in the list
    * contribute before the same name gets deduped on a later prime).
    */
-  const hasSkillAccess = (params.accessibleSkillIds?.length ?? 0) > 0;
-  const skillAuthoringAvailable = params.skillAuthoringAvailable === true;
-  let manualSkillPrimes: ResolvedManualSkill[] | undefined;
-  let alwaysApplySkillPrimes: ResolvedAlwaysApplySkill[] | undefined;
-  let extraAllowedToolNames: string[] = [];
-  let perSkillExtras: Map<string, string[]> = new Map();
   if (hasSkillAccess) {
-    const [manualPrimesResult, alwaysApplyPrimesResult] = await Promise.all([
-      params.manualSkills?.length && db.getSkillByName
-        ? resolveManualSkills({
-            names: params.manualSkills,
-            getSkillByName: db.getSkillByName,
-            accessibleSkillIds: params.accessibleSkillIds!,
-            userId: req.user?.id,
-            skillStates: params.skillStates,
-            defaultActiveOnShare: params.defaultActiveOnShare,
-          })
-        : Promise.resolve<ResolvedManualSkill[] | undefined>(undefined),
-      db.listAlwaysApplySkills
-        ? resolveAlwaysApplySkills({
-            listAlwaysApplySkills: db.listAlwaysApplySkills,
-            accessibleSkillIds: params.accessibleSkillIds!,
-            userId: req.user?.id,
-            skillStates: params.skillStates,
-            defaultActiveOnShare: params.defaultActiveOnShare,
-          })
-        : Promise.resolve<ResolvedAlwaysApplySkill[] | undefined>(undefined),
-    ]);
-
-    manualSkillPrimes = manualPrimesResult;
-    alwaysApplySkillPrimes = alwaysApplyPrimesResult;
-
-    /**
-     * Cross-list dedup: when a user `$`-invokes a skill that is also
-     * marked `always-apply`, the always-apply copy is dropped here so
-     * the same SKILL.md body isn't primed twice in the same turn.
-     * Manual wins because it sits closer to the user message and
-     * carries explicit intent. Done at the initializer (not just at
-     * splice time in `injectSkillPrimes`) so persisted user-bubble
-     * `alwaysAppliedSkills` pills reflect the post-dedup set and the
-     * tool-union step below doesn't bill allowed-tools to the dropped
-     * always-apply entry.
-     */
-    if (
-      alwaysApplySkillPrimes &&
-      alwaysApplySkillPrimes.length > 0 &&
-      manualSkillPrimes &&
-      manualSkillPrimes.length > 0
-    ) {
-      const manualNames = new Set(manualSkillPrimes.map((p) => p.name));
-      const deduped = alwaysApplySkillPrimes.filter((p) => !manualNames.has(p.name));
-      const removed = alwaysApplySkillPrimes.length - deduped.length;
-      if (removed > 0) {
-        logger.info(
-          `[initializeAgent] Dropped ${removed} always-apply prime(s) already present in the manual list; same-named skills prime only once per turn.`,
-        );
-        alwaysApplySkillPrimes = deduped;
-      }
-    }
-
-    /**
-     * Enforce the combined `MAX_PRIMED_SKILLS_PER_TURN` ceiling up-front
-     * so persisted user-bubble `alwaysAppliedSkills` pills stay in sync
-     * with what actually gets primed. `injectSkillPrimes` re-applies the
-     * cap as defense-in-depth at splice time. Always-apply primes are
-     * truncated first — manual invocation is explicit user intent and
-     * should never be silently dropped.
-     */
-    const manualCount = manualSkillPrimes?.length ?? 0;
-    const alwaysApplyCount = alwaysApplySkillPrimes?.length ?? 0;
-    if (alwaysApplySkillPrimes && manualCount + alwaysApplyCount > MAX_PRIMED_SKILLS_PER_TURN) {
-      const budgetForAlwaysApply = Math.max(0, MAX_PRIMED_SKILLS_PER_TURN - manualCount);
-      const dropped = alwaysApplyCount - budgetForAlwaysApply;
-      logger.warn(
-        `[initializeAgent] Combined primes (${manualCount} manual + ${alwaysApplyCount} always-apply) exceeds MAX_PRIMED_SKILLS_PER_TURN (${MAX_PRIMED_SKILLS_PER_TURN}); truncating ${dropped} always-apply prime(s) so persisted user-message pills stay in sync with what got primed.`,
-      );
-      alwaysApplySkillPrimes = alwaysApplySkillPrimes.slice(0, budgetForAlwaysApply);
-    }
-
     /** Skill `allowed-tools` are legacy-heal candidates too: a raw MCP key
      *  declared before the normalized-key convention would neither dedupe
      *  against the healed agent tools nor match the normalized-keyed tool
@@ -1054,10 +1239,11 @@ export async function initializeAgent(
    * `loadTools` failures take two forms:
    *   1. The wrapper throws — rare; only when something around the
    *      try/catch in `createToolLoader` itself fails.
-   *   2. The wrapper returns `undefined` — the typical CJS path: every
-   *      production loader (`createToolLoader` in `initialize.js`,
-   *      `openai.js`, `responses.js`) catches `loadAgentTools` errors and
-   *      returns `undefined`. Without explicit handling, the empty
+   *   2. The wrapper returns `undefined` — the typical CJS path for errors
+   *      that remain soft-failures. Runtime loaders rethrow invariant
+   *      failures such as an explicitly configured MCP tool set resolving
+   *      to zero, but preserve the legacy `undefined` result for unrelated
+   *      failures. Without explicit handling, the empty
    *      fallback object below would silently drop the agent's baseline
    *      tools for the turn (not just the skill-added extras).
    *
@@ -1077,6 +1263,8 @@ export async function initializeAgent(
       model: agent.model,
       tool_options: agent.tool_options,
       tool_resources,
+      requestBody,
+      codeExecutionContext,
       accessibleMcpServerNames: resolvedAuditNames,
     });
 
@@ -1086,10 +1274,13 @@ export async function initializeAgent(
   try {
     loadToolsResult = await callLoadTools(requestedToolNames);
   } catch (err) {
+    if (isFatalAgentInitializationError(err, { allowExpectedMCPFallback: true })) {
+      throw err;
+    }
     if (extraAllowedToolNames.length > 0) {
       logger.warn(
-        `[allowedTools] loadTools threw with skill-added extras [${extraAllowedToolNames.join(', ')}]; retrying without them:`,
-        err instanceof Error ? err.message : err,
+        `[allowedTools] loadTools threw with ${extraAllowedToolNames.length} skill-added extra(s); retrying without them`,
+        { errorName: err instanceof Error ? err.name : 'UnknownError' },
       );
       loadToolsResult = await callLoadTools(baseToolNames);
     } else {
@@ -1097,11 +1288,11 @@ export async function initializeAgent(
     }
   }
   if (initialFailedSilently(loadToolsResult)) {
-    /* Production loaders swallow errors and return undefined. Treat that
+    /* Runtime loaders may swallow non-invariant errors and return undefined. Treat that
        the same as a throw when extras were requested — the agent's own
        tools must still load. */
     logger.warn(
-      `[allowedTools] loadTools returned no result with skill-added extras [${extraAllowedToolNames.join(', ')}]; retrying without them.`,
+      `[allowedTools] loadTools returned no result with ${extraAllowedToolNames.length} skill-added extra(s); retrying without them.`,
     );
     loadToolsResult = await callLoadTools(baseToolNames);
   }
@@ -1115,6 +1306,7 @@ export async function initializeAgent(
     mcpAvailableTools,
     requestScopedConnections,
     hasDeferredTools,
+    mcpToolAliases,
     actionsEnabled,
     tools: structuredTools,
     primedCodeFiles,
@@ -1128,6 +1320,7 @@ export async function initializeAgent(
     requestScopedConnections: undefined,
     toolDefinitions: [],
     hasDeferredTools: false,
+    mcpToolAliases: [],
     actionsEnabled: undefined,
     primedCodeFiles: undefined,
   };
@@ -1146,17 +1339,8 @@ export async function initializeAgent(
     const loadedNames = new Set((toolDefinitions ?? []).map((d) => d.name));
     const dropped = extraAllowedToolNames.filter((n) => !loadedNames.has(n));
     if (dropped.length > 0) {
-      const sources: string[] = [];
-      for (const [skillName, names] of perSkillExtras) {
-        const droppedFromSkill = names.filter((n) => !loadedNames.has(n));
-        if (droppedFromSkill.length > 0) {
-          sources.push(`"${skillName}" → [${droppedFromSkill.join(', ')}]`);
-        }
-      }
       logger.debug(
-        `[allowedTools] Dropped unrecognized tool names: ${
-          sources.length > 0 ? sources.join('; ') : dropped.join(', ')
-        }`,
+        `[allowedTools] Dropped ${dropped.length} unrecognized tool name(s) from ${perSkillExtras.size} skill(s)`,
       );
     }
   }
@@ -1238,8 +1422,6 @@ export async function initializeAgent(
    * code-only description to the skill-aware description without adding a
    * duplicate — exactly one copy of each tool reaches the LLM.
    */
-  const agentRequestsCodeExec = (agent.tools ?? []).includes(Tools.execute_code);
-  const effectiveCodeEnvAvailable = params.codeEnvAvailable === true && agentRequestsCodeExec;
   /**
    * Capability marker → definition names its registration produced this run,
    * reported by the registrars themselves. `tool_options` entries keyed by a
@@ -1256,14 +1438,6 @@ export async function initializeAgent(
     const existing = capabilityToolNames.get(capability);
     capabilityToolNames.set(capability, existing ? [...existing, ...toolNames] : toolNames);
   };
-  /** Per-agent stateful-session truth: the admin capability AND the agent's
-   *  own builder opt-in AND a working code env. Resolved once here so the
-   *  registered bash description, the tool factories, and `createRun`'s
-   *  `toolExecution.sandbox` gate all agree for this agent. */
-  const effectiveStatefulSessions =
-    effectiveCodeEnvAvailable &&
-    params.statefulSessionsAvailable === true &&
-    agent.stateful_code_sessions === true;
   if (effectiveCodeEnvAvailable) {
     const codeExecResult = registerCodeExecutionTools({
       toolRegistry,
@@ -1476,6 +1650,7 @@ export async function initializeAgent(
       skillStates: params.skillStates,
       defaultActiveOnShare: params.defaultActiveOnShare,
       maxCatalogSkills: getMaxCatalogSkills(req),
+      resolvedCatalog: resolvedSkillCatalog,
     });
     toolDefinitions = skillResult.toolDefinitions;
     skillCount = skillResult.skillCount;
@@ -1576,6 +1751,7 @@ export async function initializeAgent(
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
+    mcpToolAliases,
     backgroundToolNames,
     intentToolNames,
     actionsEnabled,
@@ -1584,6 +1760,9 @@ export async function initializeAgent(
     memoryToolsRegistered: inlineMemoryRegistered,
     codeEnvAvailable: effectiveCodeEnvAvailable,
     statefulCodeSessions: effectiveStatefulSessions,
+    statefulCodeEnvironment,
+    codeSessionKey: codeExecutionContext.codeSessionKey,
+    codeExecutionContext,
     reasoningKey: customEndpointConfig?.customParams?.reasoningKey,
     includeReasoningHistory: customEndpointConfig?.customParams?.includeReasoningHistory,
     skillAuthoringAvailable,

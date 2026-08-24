@@ -37,6 +37,7 @@ jest.mock('@librechat/api', () => ({
   MCPTokenStorage: {
     getClientInfoAndMetadata: jest.fn(),
     getTokens: jest.fn(),
+    assertCredentialSetBinding: jest.fn(),
     deleteUserTokens: jest.fn().mockResolvedValue(undefined),
   },
   normalizeHttpError: jest.fn((error) => error),
@@ -87,6 +88,17 @@ jest.mock('~/server/services/Config/getCachedTools', () => ({
 
 jest.mock('~/server/services/Files/process', () => ({
   processDeleteRequest: jest.fn().mockResolvedValue({ deletedFileIds: [], failedFileIds: [] }),
+}));
+
+jest.mock('~/server/services/Agents/triggers', () => ({
+  drainAgentTriggerDeliveriesForUser: jest.fn(),
+  prepareAgentTriggerUserPurge: jest.fn(),
+  cancelAgentTriggerUserPurge: jest.fn(),
+  purgeAgentTriggerDeliveriesForUser: jest.fn(),
+}));
+
+jest.mock('~/server/services/Endpoints/agents/subagentThreadStore', () => ({
+  cancelAndDrainForOwner: jest.fn(),
 }));
 
 jest.mock('~/server/services/Config', () => ({
@@ -158,12 +170,53 @@ function setupMCPMocks() {
   return { flowManager, mcpManager, registry };
 }
 
+const credentialSetId = 'credential-set-a';
+const storedOAuthBinding = {
+  server_url: 'https://example.com/mcp',
+  token_endpoint: 'https://example.com/token',
+  revocation_endpoint: 'https://example.com/revoke',
+  client_source: 'dynamic',
+  credential_set_id: credentialSetId,
+};
+
 beforeEach(() => {
   jest.clearAllMocks();
   getTenantId.mockReturnValue(undefined);
 });
 
 describe('updateUserPluginsController MCP OAuth cleanup', () => {
+  it('invalidates the shared tool generation even when local disconnect fails', async () => {
+    const { mcpManager } = setupMCPMocks();
+    mcpManager.disconnectUserConnection.mockRejectedValue(new Error('local dispose failed'));
+    MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue(null);
+
+    const res = createResponse();
+    await updateUserPluginsController(createRequest(), res);
+
+    expect(mockInvalidateCachedTools).toHaveBeenCalledWith({
+      userId: 'user-1',
+      serverName: 'test-server',
+    });
+    expect(mockInvalidateCachedTools.mock.invocationCallOrder[0]).toBeLessThan(
+      mcpManager.disconnectUserConnection.mock.invocationCallOrder[0],
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+
+  it('fails the credential update response when the shared generation fence cannot move', async () => {
+    const { mcpManager } = setupMCPMocks();
+    const fenceError = new Error('Redis unavailable');
+    mockInvalidateCachedTools.mockRejectedValue(fenceError);
+    MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue(null);
+
+    const res = createResponse();
+    await updateUserPluginsController(createRequest(), res);
+
+    expect(mcpManager.disconnectUserConnection).toHaveBeenCalledWith('user-1', 'test-server');
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(logger.error).toHaveBeenCalledWith('[updateUserPluginsController]', fenceError);
+  });
+
   it('clears stored OAuth token state when client metadata is missing', async () => {
     const { flowManager, mcpManager } = setupMCPMocks();
     MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue(null);
@@ -337,7 +390,7 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
     const { flowManager } = setupMCPMocks();
     MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue({
       clientInfo: { client_id: 'client-1' },
-      clientMetadata: {},
+      clientMetadata: storedOAuthBinding,
     });
     MCPTokenStorage.getTokens.mockRejectedValue(new Error('token lookup failed'));
 
@@ -371,11 +424,15 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
     setupMCPMocks();
     MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue({
       clientInfo: { client_id: 'client-1', client_secret: 'secret-1' },
-      clientMetadata: { revocation_endpoint: 'https://example.com/revoke' },
+      clientMetadata: {
+        ...storedOAuthBinding,
+        revocation_endpoint: 'https://example.com/revoke',
+      },
     });
     MCPTokenStorage.getTokens.mockResolvedValue({
       access_token: 'access-token',
       refresh_token: 'refresh-token',
+      credential_set_id: credentialSetId,
     });
     MCPOAuthHandler.revokeOAuthToken.mockResolvedValue();
 
@@ -388,6 +445,11 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
       serverName: 'test-server',
       findToken: mockFindToken,
     });
+    expect(MCPTokenStorage.assertCredentialSetBinding).toHaveBeenCalledWith(
+      'test-server',
+      credentialSetId,
+      expect.objectContaining({ credential_set_id: credentialSetId }),
+    );
     expect(MCPOAuthHandler.revokeOAuthToken).toHaveBeenCalledWith(
       'test-server',
       'access-token',
@@ -429,10 +491,11 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
     setupMCPMocks();
     MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue({
       clientInfo: { client_id: 'client-1', client_secret: 'secret-1' },
-      clientMetadata: {},
+      clientMetadata: storedOAuthBinding,
     });
     MCPTokenStorage.getTokens.mockResolvedValue({
       access_token: 'access-token',
+      credential_set_id: credentialSetId,
     });
     MCPOAuthHandler.revokeOAuthToken.mockResolvedValue();
 
@@ -461,10 +524,11 @@ describe('updateUserPluginsController MCP OAuth cleanup', () => {
     setupMCPMocks();
     MCPTokenStorage.getClientInfoAndMetadata.mockResolvedValue({
       clientInfo: { client_id: 'client-1', client_secret: 'secret-1' },
-      clientMetadata: {},
+      clientMetadata: storedOAuthBinding,
     });
     MCPTokenStorage.getTokens.mockResolvedValue({
       refresh_token: 'refresh-token',
+      credential_set_id: credentialSetId,
     });
     MCPOAuthHandler.revokeOAuthToken.mockResolvedValue();
 
